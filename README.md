@@ -136,7 +136,7 @@ When `--run` is invoked, `airgap-check` launches a container with **kernel-isola
 
 ---
 
-## Built by the Team Behind [Frame (Humanet Cloud)](https://humanet.dev)
+## Built by the Team Behind [Frame by Humanet](https://humanet.dev)
 
 `airgap-check` is open-sourced by [Humanet](https://humanet.dev). Move your AI apps into air-gapped environments using the `--fix` `Dockerfile` generator above in any standard Docker/Kubernetes stack.
 
