@@ -1,4 +1,4 @@
-![Humanet Airgap](https://i.ibb.co/XfxYbD8k/airgap.png) 
+![Humanet Airgap](https://i.ibb.co/Q7zs46nb/Add-a-heading-4.png) 
 # `airgap-check` — Offline (`--network none`), Telemetry & Secret Auditor for AI Repositories
 
 [![Go 1.22+](https://img.shields.io/badge/go-1.22+-00ADD8.svg)](https://go.dev)
