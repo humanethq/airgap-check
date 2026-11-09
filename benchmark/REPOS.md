@@ -26,9 +26,9 @@ Used during initial development to identify failure modes and calibrate false-po
 
 ## Phase 2: Held-Out Evaluation Set (10 Repositories)
 
-Rules were frozen prior to evaluating these repositories. Each repository was scanned statically with `airgap-check` and dynamically executed inside a container with `--network none` using `airgap-eval-py:latest` (`python:3.12-slim-bookworm` with standard dependencies installed).
+Rules were frozen prior to evaluating these repositories. These are probe-based tests: we did not start the applications themselves. Each repository was scanned statically with `airgap-check` and dynamically executed inside a container with `--network none` using `airgap-eval-py:latest` (`python:3.12-slim-bookworm` with standard dependencies installed) running a probe call that exercised the specific library functions flagged by the static scan.
 
-| Repository | Upstream URL | Commit SHA | Exact Command Executed Under `--network none` | Result & Measured Time | Intercepted Host(s) |
+| Repository | Upstream URL | Commit SHA | Probe Command Executed Under `--network none` | Probe Result & Measured Time | Intercepted Host(s) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `gpt-engineer` | `https://github.com/gpt-engineer-org/gpt-engineer.git` | `a90fcd543eedcc0ff2c34561bc0785d2ba83c47e` | `python3 -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"` | exit 1 (343 ms) | `openaipublic.blob.core.windows.net` |
 | `gpt-researcher` | `https://github.com/assafelovic/gpt-researcher.git` | `b81060b2d5f382b30a0ea9d95bf799fd9835c34e` | `python3 -c "import tiktoken, nltk; nltk.download('punkt'); tiktoken.get_encoding('cl100k_base')"` | exit 1 (477 ms) | `raw.githubusercontent.com`, `openaipublic.blob.core.windows.net` |

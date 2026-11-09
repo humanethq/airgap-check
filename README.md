@@ -104,7 +104,7 @@ Limits:
 
 We ran airgap-check on 20 open-source Python and TypeScript AI repositories in two phases. Phase 1 (10 repos) was used to find failure modes and tune the rules. Phase 2 (10 repos) is a held-out set: the rules were frozen at commit `8ce2f11` before we ran it.
 
-Under `--network none`, we executed each repository's core entrypoint or probe call exercising its declared dependencies (for example, `tiktoken.get_encoding('cl100k_base')` on `gpt-engineer`, default ChromaDB collection creation & insertion on `mem0` and `vanna`, Hugging Face model resolution on `docling` and `quivr`, and a baseline startup probe on `chat-langchain`). Exact commands, upstream URLs, and commit SHAs are documented in [`benchmark/REPOS.md`](benchmark/REPOS.md).
+These are probe-based tests: we did not start the applications themselves. Under `--network none`, we executed probe calls exercising the specific library functions flagged by the static scan (for example, `tiktoken.get_encoding('cl100k_base')` for `gpt-engineer`, ChromaDB collection creation and insertion for `mem0` and `vanna`, Hugging Face model resolution for `docling` and `quivr`, and a baseline probe for `chat-langchain`). Exact probe commands, upstream URLs, and commit SHAs are documented in [`benchmark/REPOS.md`](benchmark/REPOS.md).
 
 ### What the libraries do offline
 
@@ -123,7 +123,7 @@ Times were measured in a container with no network and an immediately refusing D
 
 ### Held-out results (10 repos, rules frozen)
 
-| Repository | Result under `--network none` | TP | FP | FN |
+| Repository | Probe result under `--network none` | TP | FP | FN |
 | :--- | :--- | :-: | :-: | :-: |
 | `gpt-engineer` | exit 1 (`tiktoken`) | 1 | 0 | 0 |
 | `gpt-researcher` | exit 1 (`tiktoken`, `nltk`) | 4 | 0 | 0 |
@@ -136,7 +136,7 @@ Times were measured in a container with no network and an immediately refusing D
 | `pydantic-ai` | exit 1 (`tiktoken`) | 3 | 2 | 0 |
 | `chat-langchain` | exit 0, no asset downloads | – | 0 | 0 |
 
-`chat-langchain` also had two telemetry findings, which are counted separately and are not part of the crash and download metrics below.
+These are probe-based tests: we did not start the applications themselves. A “true positive” means the flagged library fetches something when its call runs offline; it does not prove the repository reaches that call in normal operation. Telemetry findings (for example langsmith, posthog or sentry in several repos) are not scored in the metrics below.
 
 At component level: 35 true positives, 4 false positives, 5 false negatives. That is 89.7% precision and 87.5% recall. This is a small sample, so treat the numbers as rough. At repository level, all 9 repositories with first-use downloads were flagged, and `chat-langchain` was correctly flagged as clean.
 
