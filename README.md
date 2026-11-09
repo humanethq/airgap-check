@@ -1,98 +1,64 @@
-![Humanet Airgap](docs/head.png) 
-# `airgap-check` — Offline (`--network none`), Telemetry & Secret Auditor for AI Repositories
+# airgap-check
 
-[![Go 1.22+](https://img.shields.io/badge/go-1.22+-00ADD8.svg)](https://go.dev)
-[![Zero Dependencies](https://img.shields.io/badge/dependencies-zero%20(stdlib)-brightgreen.svg)](#installation)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+Find out what your AI app downloads, or tries to reach, when the network goes away.
 
-**What happens when you deploy a modern Python or TypeScript AI application into an air-gapped VPC, SCIF, hospital network, or `--network none` container?**
+![airgap-check](docs/banner.png)
 
-Even when your application points at a local LLM (vLLM, Ollama) or an internal enterprise gateway, **popular AI libraries silently phone home at runtime** to fetch tokenizer ranks, ONNX embedding weights, corpus zip files, cost maps, or background OTLP telemetry—causing immediate `ConnectError` crashes or **23s–39s retry hangs** per request.
+![Go 1.22+](https://img.shields.io/badge/go-1.22+-00ADD8.svg) ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 
-`airgap-check` is a standalone, zero-dependency CLI that:
-1. **Statically audits** manifests (`requirements.txt`, `pyproject.toml`, `package.json`, `Cargo.toml`), source code (`nltk.download()`, `from_pretrained()`, `tiktoken.get_encoding()`, `whisper.load_model()`, `next/font/google`), and `.env` credential types (**never reading or logging secret values**).
-2. **Dynamically executes (`--run`)** your repository inside `docker run --rm --network none` with an in-container **UDP:53 DNS sinkhole (`127.0.0.1:53`)** plus Python/Node socket hooks—capturing outbound DNS queries from **any language or native C/C++/Rust extension** (`onnxruntime`, `tokenizers`, `libcurl`, `getent`) before they fail closed.
-3. **Generates a ready-to-paste `Dockerfile` fix (`--fix`)** with hermetic `ENV` flags and build-time `RUN` pre-warming commands (`tiktoken`, `chromadb` ONNX `all-MiniLM-L6-v2`, `fastembed`, `huggingface_hub`, `nltk`, `spacy`, `whisper`, `playwright`) that works in any standard Docker or Kubernetes pipeline.
+## Why
 
----
+A common assumption: point the LLM base URL at a local vLLM or Ollama instance and the app is ready for an offline network (an air-gapped VPC, a hospital or defense network, a container with no internet). In practice, many libraries fetch something on first use: tokenizer ranks, ONNX embedding weights, corpora, price maps, or telemetry. Offline, these calls either fail at first use or hang for tens of seconds on retry backoff.
 
-## Empirical Benchmark: We Ran 20 Open-Source AI Repositories Under `docker run --network none`
+None of this is a bug in those libraries. They download once and cache. It only becomes visible when the network is gone. airgap-check tries to surface it before you deploy.
 
-To avoid overfitting static rules to a single codebase, we evaluated `airgap-check` in two phases:
-- **Phase 1 (Calibration Set — 10 Repositories):** Used to discover real runtime failure modes and calibrate false-positive filters (`devDependencies` vs `dependencies`, Python-only `tiktoken` vs bundled JS `js-tiktoken`, local signing keys vs wire API keys).
-- **Phase 2 (Out-of-Sample Holdout Set — 10 Unseen Repositories):** Rules were **frozen** (`commit 8ce2f11`) and tested against 10 new, unseen AI repositories alongside real `docker run --rm --network none` execution.
+## What it does
 
-### Top Runtime Surprises Observed Under `--network none`
+- **Static scan.** Reads manifests (`requirements.txt`, `pyproject.toml`, `package.json`, `Cargo.toml`), looks for code patterns (`nltk.download()`, `from_pretrained()`, `tiktoken.get_encoding()`, `whisper.load_model()`, `next/font/google`) and classifies `.env` keys. It reads key names only; secret values are never read or logged.
+- **`--run`.** Runs your app in `docker run --rm --network none` with a DNS sinkhole and socket hooks, and logs every lookup and connection attempt.
+- **`--fix`.** Prints Dockerfile lines (offline `ENV` flags and build-time pre-warming commands) that you can adapt for your own image.
 
-| Library / Call | What Happens in `--network none` | Hidden Egress Destination | Measured Failure Time |
-| :--- | :--- | :--- | :--- |
-| **`fastembed` (`TextEmbedding()`)** | Hangs on 3 exponential retries (`3s + 9s + 27s`) before raising `ValueError: Could not load model` | `huggingface.co:443` / `storage.googleapis.com` | **39,200 ms** (hang + crash) |
-| **`huggingface_hub` (`hf_hub_download()`)** | Retries HTTP metadata checks with backoff before raising `LocalEntryNotFoundError` | `huggingface.co:443` | **23,523 ms** (hang + crash) |
-| **`chromadb` (`collection.add()`)** | Default embedding function downloads `all-MiniLM-L6-v2` (`onnx.tar.gz`) via `httpx` | `chroma-onnx-models.s3.amazonaws.com:443` | **581–662 ms** (`ConnectError` crash) |
-| **`tiktoken` (`get_encoding("cl100k_base")`)** | Fetches `.tiktoken` BPE rank file over HTTPS on first tokenization call | `openaipublic.blob.core.windows.net:443` | **343–557 ms** (`ConnectionError` crash) |
-| **`nltk` (`nltk.download("punkt")`)** | Attempts to fetch XML index & corpus zip at runtime | `raw.githubusercontent.com:443` | **477 ms** (`False` / `LookupError` crash) |
-| **`playwright` (`chromium.launch()`)** | Fails immediately if headless browser binary was not baked into `PLAYWRIGHT_BROWSERS_PATH` | `playwright.azureedge.net:443` | **702 ms** (`Error: Executable doesn't exist`) |
-| **`litellm` (`get_model_cost_map()`)** | Pulls live model pricing JSON from GitHub unless `LITELLM_LOCAL_MODEL_COST_MAP=True` | `raw.githubusercontent.com:443` | **234 ms** (fallback warning / delay) |
-| **`crewai` / `chromadb` telemetry** | Spawns background OTLP / PostHog threads on startup unless disabled via `ENV` | `telemetry.crewai.com:4319`, `us.i.posthog.com:443` | Background thread timeout |
+Go standard library only. `--run` requires Docker.
 
----
-
-### Out-of-Sample Holdout Evaluation (10 Unseen AI Repositories, Frozen Rules)
-
-After freezing the rule set, we ran `airgap-check` against 10 unseen repositories (`chat-langchain`, `docling`, `gpt-engineer`, `gpt-researcher`, `litellm`, `llama_index`, `mem0`, `pydantic-ai`, `quivr`, `vanna`) and compared static predictions against ground-truth manifest inspection and `docker run --rm --network none` execution:
-
-| Holdout Repository | Scanned Scope | Static Crash Findings (Frozen Rules) | `--network none` Dynamic Verification (`UDP:53` + Socket Capture) | Component-Level Classification (TP / FP / FN) |
-| :--- | :--- | :--- | :--- | :--- |
-| **`gpt-engineer`** | 1 manifest, 61 src files | `tiktoken` (`pyproject.toml`, `token_usage.py`) | `exit=1` (**343 ms**) — `dns_udp53` & `dns_getaddrinfo` -> `openaipublic.blob.core.windows.net` | **1 TP**, 0 FP, 0 FN |
-| **`gpt-researcher`** | 14 manifests, 317 src files | `tiktoken`, `nltk`, `playwright`, `next/font/google` (+ `langsmith` telemetry) | `exit=1` (**477 ms**) — `dns_udp53` -> `raw.githubusercontent.com`, `openaipublic.blob.core.windows.net` | **4 TP**, 0 FP, 0 FN |
-| **`llama_index`** | 722 manifests, 2,175 src files | `tiktoken`, `nltk`, `fastembed`, `sentence-transformers`, `transformers`, `chromadb`, `whisper`, `playwright` | `exit=1` (**557 ms**) — `dns_udp53` -> `openaipublic.blob.core.windows.net` | **8 TP**, 0 FP, **2 FN** (`flagembedding`, `paddleocr` in integration packages) |
-| **`mem0`** | 24 manifests, 709 src files | `chromadb`, `fastembed`, `sentence-transformers`, `transformers`, `spacy`, `next/font/google` (+ `posthog` telemetry) | `exit=1` (**662 ms**) — `dns_udp53` -> `chroma-onnx-models.s3.amazonaws.com` | **6 TP**, 0 FP, 0 FN |
-| **`vanna`** | 3 manifests, 316 src files | `chromadb`, `fastembed`, `transformers`, `from_pretrained()` | `exit=1` (**581 ms**) — `dns_udp53` -> `chroma-onnx-models.s3.amazonaws.com` | **4 TP**, 0 FP, 0 FN |
-| **`quivr`** | 41 manifests, 785 src files | `from_pretrained/hf_hub_download`, `sentence-transformers`, `transformers` | `exit=1` (**23,523 ms**) — `dns_udp53` -> `huggingface.co` (exponential retry hang) | **3 TP**, 0 FP, 0 FN |
-| **`docling`** | 3 manifests, 416 src files | `from_pretrained/snapshot_download`, `transformers`, `whisper`, `playwright` | `exit=1` (**400 ms**) — `dns_udp53` -> `huggingface.co` | **3 TP**, **1 FP** (`playwright` in dev group), **2 FN** (`easyocr`, `rapidocr` model downloads) |
-| **`litellm`** | 90 manifests, 7,169 src files | `tiktoken`, `from_pretrained()`, `next/font/google`, `playwright` (+ `sentry-sdk`) | `exit=1` (**234 ms**) — `dns_udp53` -> `raw.githubusercontent.com` | **3 TP**, **1 FP** (`playwright` in proxy extras), **1 FN** (`model_prices_and_context_window.json` fetch) |
-| **`pydantic-ai`** | 10 manifests, 1,485 src files | `tiktoken`, `sentence-transformers`, `transformers`, `playwright` (+ `langsmith`, `posthog`) | `exit=1` (**357 ms**) — `dns_udp53` -> `openaipublic.blob.core.windows.net` | **3 TP**, **2 FP** (`playwright` in dev group; `posthog` extra name in harness), 0 FN |
-| **`chat-langchain`** | 2 manifests, 50 src files | 0 local asset crash risks (+ `langsmith` browser & server telemetry) | `exit=0` (**137 ms**) — 0 local asset downloads | **1 TN** (crash), **2 TP** (telemetry), 0 FP, 0 FN |
-
-#### Holdout Summary Metrics (Component-Level Crash & Telemetry Detection)
-- **Repository-Level Offline Crash Detection:** **9 / 9** repositories with offline runtime downloaders identified (**100% repo-level recall**), **1 / 1** true negative (`chat-langchain`).
-- **Component-Level True Positives (TP):** **35** verified runtime downloader / telemetry components across the 10 unseen repositories.
-- **Component-Level False Positives (FP):** **4** (`89.7%` precision).
-  - *Root cause of all 4 FPs:* While `package.json` is parsed into AST to strip `devDependencies`, `pyproject.toml` was scanned as text, causing dev/test dependency groups (`playwright` in `docling` and `pydantic-ai`) or optional extras names (`posthog = ["pydantic-ai-slim[mcp]"]`) to trigger static warnings.
-- **Component-Level False Negatives (FN):** **5** (`87.5%` component-level recall).
-  - *Root cause of the 5 FNs:* OCR weight downloaders (`easyocr`, `rapidocr`, `paddleocr`), `FlagEmbedding`, and LiteLLM's startup GitHub JSON fetch (`model_prices_and_context_window.json`) were not in the frozen static rule table—demonstrating why **dynamic `--run` verification (`UDP:53` DNS capture)** is essential alongside static scanning.
-
----
-
-## Installation
+## Install
 
 ```bash
-# Option 1: One-line binary install (macOS & Linux — no Go required)
+# macOS and Linux
 curl -fsSL https://raw.githubusercontent.com/humanethq/airgap-check/main/install.sh | sh
 
-# Option 2: Install directly with Go 1.22+ (zero external dependencies)
+# With Go 1.22+ (also works on Windows)
 go install github.com/humanethq/airgap-check/cmd/airgap-check@latest
 
-# Option 3: Build from source
+# From source
 git clone https://github.com/humanethq/airgap-check.git
-cd airgap-check
-make build
-./bin/airgap-check --help
+cd airgap-check && make build && ./bin/airgap-check --help
 ```
-
----
 
 ## Usage
 
-### 1. Static Audit + Ready-to-Paste `Dockerfile` Remediation (`--fix`)
 ```bash
-airgap-check --fix /path/to/your/repo
+# static scan
+airgap-check /path/to/repo
+
+# static scan plus a Dockerfile snippet
+airgap-check --fix /path/to/repo
+
+# run in a container with no network
+airgap-check --run /path/to/repo
+
+# use your own image and a smoke test that exercises your code paths
+airgap-check --run --image my-app:latest --run-cmd "python3 -m pytest tests/smoke_test.py" /path/to/repo
+
+# machine-readable output
+airgap-check --json /path/to/repo
 ```
-Generates a complete report of runtime downloaders, server vs. browser telemetry (`posthog-js` in frontend vs. `posthog`/`chromadb` in Python), `.env` credential classifications (`wire_api_key` vs. `local_signing_or_internal` like `JWT_SECRET_KEY` vs. `signed_request_flow` like `CLOUDINARY_API_SECRET`), and prints a **100% standalone `Dockerfile` block**:
+
+### Example `--fix` output (abridged)
+
+Read this before applying it: if your app loads Hugging Face models, pre-warm them at build time before setting `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`. Without a warm cache the app fails at startup instead of hanging.
 
 ```dockerfile
-# --- BEGIN AIR-GAP & TELEMETRY REMEDIATION (paste into your Dockerfile) ---
-# 1. Silence background SDK telemetry & enforce writable offline cache paths
+# --- BEGIN AIR-GAP & TELEMETRY REMEDIATION ---
 ENV DO_NOT_TRACK=1 \
     NEXT_TELEMETRY_DISABLED=1 \
     ANONYMIZED_TELEMETRY=False \
@@ -112,56 +78,105 @@ ENV DO_NOT_TRACK=1 \
     PLAYWRIGHT_BROWSERS_PATH=/app/.cache/ms-playwright
 RUN mkdir -p /app/.cache/tiktoken /app/.cache/huggingface /app/.cache/nltk_data /app/.cache/ms-playwright
 
-# Pre-warm Python tiktoken BPE encodings (cl100k_base & o200k_base) at build time
+# Pre-warm Python tiktoken encodings at build time
 RUN TIKTOKEN_CACHE_DIR=/app/.cache/tiktoken python3 -c "import tiktoken; [tiktoken.get_encoding(e) for e in ('cl100k_base', 'o200k_base')]"
 
-# Pre-warm ChromaDB default ONNX embedding model (all-MiniLM-L6-v2) at build time
+# Pre-warm ChromaDB's default ONNX embedding model at build time
 RUN HOME=/app XDG_CACHE_HOME=/app/.cache python3 -c "from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2; ef = ONNXMiniLM_L6_V2(); ef(['airgap-warmup'])"
 # --- END AIR-GAP & TELEMETRY REMEDIATION ---
 ```
 
-### 2. Dynamic Verification Inside `docker run --rm --network none` (`--run`)
-```bash
-# Run with default ecosystem image or pass your built application image:
-airgap-check --run --image my-app:latest --run-cmd "python3 -m pytest tests/smoke_test.py" /path/to/repo
-```
+## How `--run` works, and where it stops
 
-#### How Dynamic Capture Works (and Its Exact Boundaries)
-When `--run` is invoked, `airgap-check` launches a container with **kernel-isolated `--network none`** (zero external network interfaces) and mounts a read-only observer into `/tmp/airgap_hook`:
-- **Language-Agnostic `UDP:53` DNS Sinkhole (`127.0.0.1:53`):** Binds `127.0.0.1:53/udp` inside the container network namespace and points `/etc/resolv.conf` to `nameserver 127.0.0.1`. Any DNS lookup—whether from Python, Node.js, Go, Rust, C/C++ native extensions (`onnxruntime`, `libcurl`), or subprocesses (`curl`, `getent`)—is recorded (`dns_udp53`) and immediately answered with `NXDOMAIN` so it fails fast and visibly.
-- **Language Socket Hooks:** Injects `sitecustomize.py` (`socket.getaddrinfo`, `socket.connect`) and `node_preload.js` (`dns.lookup`, `net.Socket.connect`) to capture socket-level metadata.
-- **Explicit Limitation:** Only code paths exercised by `--run-cmd` are dynamically tested, and raw hardcoded-IP TCP connections from static non-Python/Node binaries that bypass DNS require a custom `--internal` bridge.
+`--run` starts a container with `--network none`, mounts your repository read-only, and mounts a small observer:
 
----
+- A DNS sinkhole on `127.0.0.1:53/udp`. `/etc/resolv.conf` points to it, so lookups that go through the container's resolver are recorded and answered with `NXDOMAIN`.
+- Python (`sitecustomize.py`) and Node (`node_preload.js`) hooks that record socket-level attempts.
 
-## Supported Modules & Rules Reference
+Limits:
 
-| Category | Module / Pattern | Ecosystem | Hidden Egress Host(s) | `--fix` Remediation |
-| :--- | :--- | :--- | :--- | :--- |
-| **Runtime Model / Asset** | `tiktoken` / `tiktoken.get_encoding()` | Python | `openaipublic.blob.core.windows.net` | Pre-warms `cl100k_base` & `o200k_base` into `TIKTOKEN_CACHE_DIR` |
-| **Runtime Model / Asset** | `chromadb` (default ONNX embedding) | Python | `chroma-onnx-models.s3.amazonaws.com` | Pre-warms `ONNXMiniLM_L6_V2()` into `XDG_CACHE_HOME` |
-| **Runtime Model / Asset** | `fastembed` (`TextEmbedding()`) | Python | `huggingface.co`, `cdn-lfs.hf.co` | Pre-warms `TextEmbedding(cache_dir=...)` during build |
-| **Runtime Model / Asset** | `sentence-transformers` / `transformers` / `from_pretrained()` | Python / JS | `huggingface.co`, `cdn-lfs.hf.co` | Pre-populates `HF_HOME` + sets `HF_HUB_OFFLINE=1` & `TRANSFORMERS_OFFLINE=1` |
-| **Runtime Model / Asset** | `whisper` / `whisper.load_model()` | Python | `openaipublic.azureedge.net` | Pre-warms Whisper `.pt` checkpoint into `XDG_CACHE_HOME/whisper` |
-| **Runtime Model / Asset** | `playwright` | Python / Node | `playwright.azureedge.net` | Runs `npx playwright install --with-deps chromium` into `PLAYWRIGHT_BROWSERS_PATH` |
-| **Runtime Model / Asset** | `nltk` / `nltk.download()` | Python | `raw.githubusercontent.com` | Pre-downloads corpora into `NLTK_DATA` via `python3 -m nltk.downloader` |
-| **Runtime Model / Asset** | `spacy` / `spacy.cli.download()` | Python | `raw.githubusercontent.com` | Installs `en_core_web_sm` wheel during build |
-| **Runtime Model / Asset** | `torch.hub.load()` | Python | `github.com`, `download.pytorch.org` | Pre-populates `TORCH_HOME` during build |
-| **Build-Time Asset** | `next/font/google` | Next.js | `fonts.googleapis.com`, `fonts.gstatic.com` | Recommends `next/font/local` for offline builds |
-| **Server Telemetry** | `chromadb`, `crewai`, `langsmith`, `scarf` | Python / Node | `*.posthog.com`, `telemetry.crewai.com:4319`, `api.smith.langchain.com`, `scarf.sh` | Silences via `ANONYMIZED_TELEMETRY=False`, `CREWAI_DISABLE_TELEMETRY=true`, `OTEL_SDK_DISABLED=true`, `LANGCHAIN_TRACING_V2=false`, `SCARF_NO_ANALYTICS=true`, `DO_NOT_TRACK=1` |
-| **Browser Telemetry** | `posthog-js`, `@sentry/*` (in frontend paths) | Browser JS | `us.i.posthog.com`, `ingest.sentry.io` | Flags as `browser_client` (server `ENV` vars do not silence browser requests) |
-| **`.env` Credentials** | `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `GROQ_*`, `MISTRAL_*`, `COHERE_*`, `DEEPSEEK_*`, `TOGETHER_*`, `STRIPE_*`, `GITHUB_TOKEN`, `JWT_*`, `CLOUDINARY_*`, `AWS_SECRET*` | All | Classifies into `wire_api_key` vs `local_signing_or_internal` vs `signed_request_flow` | Audits `.env` key names & `git ls-files` status without ever reading or logging secret values |
+- We validated `--run` on Python and Node targets. Other runtimes should be caught if they use the system resolver, but we have not verified that.
+- Traffic to hardcoded IP addresses, or DNS-over-HTTPS, skips the resolver and is not caught.
+- Only the code paths you exercise are tested. Use `--run-cmd` to run a smoke test that covers the paths you care about.
+- The sinkhole refuses immediately. In a real enclave, packets may be dropped instead, so hangs can be longer than the times below.
 
----
+## Benchmark
 
-## Security & Privacy Guarantees
-- **Secret values are never read, stored, or logged.** `.env` files are inspected solely for key names, non-empty presence, and `git ls-files` tracking status.
-- **Read-only workspace mount:** `airgap-check --run` mounts your repository `:ro` (`-v $PWD:/workspace:ro`) inside `--network none`.
+We ran airgap-check on 20 open-source Python and TypeScript AI repositories in two phases. Phase 1 (10 repos) was used to find failure modes and tune the rules. Phase 2 (10 repos) is a held-out set: the rules were frozen at commit `8ce2f11` before we ran it.
 
----
+Under `--network none`, we executed each repository's core entrypoint or probe call exercising its declared dependencies (for example, `tiktoken.get_encoding('cl100k_base')` on `gpt-engineer`, default ChromaDB collection creation & insertion on `mem0` and `vanna`, Hugging Face model resolution on `docling` and `quivr`, and a baseline startup probe on `chat-langchain`). Exact commands, upstream URLs, and commit SHAs are documented in [`benchmark/REPOS.md`](benchmark/REPOS.md).
 
-## Built by the Team Behind [Frame by Humanet](https://humanet.dev)
+### What the libraries do offline
 
-`airgap-check` is open-sourced by [Humanet](https://humanet.dev). Move your AI apps into air-gapped environments using the `--fix` `Dockerfile` generator above in any standard Docker/Kubernetes stack.
+| Library / call | Behaviour with no network | Host it tries | Observed |
+| :--- | :--- | :--- | :--- |
+| `fastembed` `TextEmbedding()` | Retries 3 times (3 s, 9 s, 27 s), then raises `ValueError: Could not load model` | `huggingface.co` | ~39 s |
+| `huggingface_hub` `hf_hub_download()` | Retries metadata checks with backoff, then raises `LocalEntryNotFoundError` | `huggingface.co` | ~23.5 s |
+| `chromadb` `collection.add()` | Default embedding function downloads the `all-MiniLM-L6-v2` ONNX model | `chroma-onnx-models.s3.amazonaws.com` | fails in under 1 s |
+| `tiktoken` (Python) `get_encoding()` | Fetches the BPE rank file on first use | `openaipublic.blob.core.windows.net` | fails in under 1 s |
+| `nltk` `nltk.download()` | Tries to fetch the index and corpus | `raw.githubusercontent.com` | fails in under 1 s |
+| `playwright` `chromium.launch()` | Fails if the browser binary was not baked into the image | `playwright.azureedge.net` | fails in under 1 s |
+| `litellm` | Fetches its model price map at startup unless `LITELLM_LOCAL_MODEL_COST_MAP=True` | `raw.githubusercontent.com` | fallback warning |
+| `crewai`, `chromadb` | Background telemetry threads on startup unless disabled | `telemetry.crewai.com:4319`, `us.i.posthog.com` | background timeouts |
 
-If you want **zero-config Firecracker microVM isolation**, **automatic build-time cache sealing**, and **wire-level Phantom Secret injection** (where real API keys never enter guest VM memory and are swapped at the host proxy only for allowlisted hosts and HTTP methods), check out **[Frame](https://humanet.dev)**.
+Times were measured in a container with no network and an immediately refusing DNS sinkhole (see limits above). Browser-side telemetry, such as `posthog-js` in a frontend bundle, is a separate case: server environment variables do not silence it, because the requests leave from the user's browser.
+
+### Held-out results (10 repos, rules frozen)
+
+| Repository | Result under `--network none` | TP | FP | FN |
+| :--- | :--- | :-: | :-: | :-: |
+| `gpt-engineer` | exit 1 (`tiktoken`) | 1 | 0 | 0 |
+| `gpt-researcher` | exit 1 (`tiktoken`, `nltk`) | 4 | 0 | 0 |
+| `llama_index` | exit 1 (`tiktoken`) | 8 | 0 | 2 |
+| `mem0` | exit 1 (`chromadb` ONNX) | 6 | 0 | 0 |
+| `vanna` | exit 1 (`chromadb` ONNX) | 4 | 0 | 0 |
+| `quivr` | exit 1 (`huggingface.co`, ~23.5 s of retries) | 3 | 0 | 0 |
+| `docling` | exit 1 (`huggingface.co`) | 3 | 1 | 2 |
+| `litellm` | exit 1 (`raw.githubusercontent.com`) | 3 | 1 | 1 |
+| `pydantic-ai` | exit 1 (`tiktoken`) | 3 | 2 | 0 |
+| `chat-langchain` | exit 0, no asset downloads | – | 0 | 0 |
+
+`chat-langchain` also had two telemetry findings, which are counted separately and are not part of the crash and download metrics below.
+
+At component level: 35 true positives, 4 false positives, 5 false negatives. That is 89.7% precision and 87.5% recall. This is a small sample, so treat the numbers as rough. At repository level, all 9 repositories with first-use downloads were flagged, and `chat-langchain` was correctly flagged as clean.
+
+False positives (all 4): `pyproject.toml` is scanned as text, so dev and test dependency groups (`playwright` in `docling`, `litellm`, `pydantic-ai`) and an optional extra named `posthog` triggered warnings. `package.json` is parsed, so its `devDependencies` are skipped.
+
+False negatives (all 5): OCR weight downloaders (`easyocr`, `rapidocr`, `paddleocr`), `FlagEmbedding`, and LiteLLM's startup fetch of `model_prices_and_context_window.json` were not in the frozen rule table. `--run` is meant to catch this kind of miss, but only on the paths it exercises.
+
+## Supported checks
+
+| Category | Pattern | Host(s) | `--fix` |
+| :--- | :--- | :--- | :--- |
+| Runtime download | `tiktoken` (Python) | `openaipublic.blob.core.windows.net` | pre-warms `cl100k_base`, `o200k_base` |
+| Runtime download | `chromadb` default embedder | `chroma-onnx-models.s3.amazonaws.com` | pre-warms `ONNXMiniLM_L6_V2` |
+| Runtime download | `fastembed` | `huggingface.co`, `cdn-lfs.hf.co` | pre-warms the model cache |
+| Runtime download | `sentence-transformers`, `transformers`, `from_pretrained()` | `huggingface.co`, `cdn-lfs.hf.co` | sets offline `ENV` flags; prints model snapshot template |
+| Runtime download | `whisper.load_model()` | `openaipublic.azureedge.net` | pre-warms the checkpoint |
+| Runtime download | `playwright` | `playwright.azureedge.net` | installs the browser into `PLAYWRIGHT_BROWSERS_PATH` |
+| Runtime download | `nltk.download()` | `raw.githubusercontent.com` | pre-downloads corpora into `NLTK_DATA` |
+| Runtime download | `spacy.cli.download()` | `raw.githubusercontent.com` | installs the model wheel at build time |
+| Runtime download | `torch.hub.load()` | `github.com`, `download.pytorch.org` | flagged only; pre-populate `TORCH_HOME` manually |
+| Build-time download | `next/font/google` | `fonts.googleapis.com`, `fonts.gstatic.com` | flagged only; suggests `next/font/local` |
+| Server telemetry | `chromadb`, `crewai`, `langsmith`, `scarf` | PostHog, `telemetry.crewai.com`, `api.smith.langchain.com`, `scarf.sh` | sets the matching disable flags |
+| Browser telemetry | `posthog-js`, `@sentry/*` in frontend code | PostHog, Sentry | flagged only; disable the SDK in your frontend code |
+| `.env` keys | `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `STRIPE_*`, `JWT_*`, `CLOUDINARY_*`, `AWS_SECRET*` and others | n/a | flagged only; classifies key names and git tracking status |
+
+## Design principles
+
+- Secret values are never read, stored or logged. `.env` files are inspected for key names, non-empty presence, and `git ls-files` status.
+- `--run` mounts your repository read-only.
+
+airgap-check is not a security certification. It reports what it observed; a clean result does not prove that your application is safe to run in an isolated network.
+
+## Contributing
+
+Found a library that quietly phones home, or a false positive on your repo? Open an issue with the package name, the call, and the host it tries to reach, and we will add or fix the rule.
+
+## About
+
+Open-sourced by [Humanet](https://humanet.dev), which is also building Frame, an early-stage hosting platform.
+
+## License
+
+MIT
