@@ -66,10 +66,13 @@ After freezing the rule set, we ran `airgap-check` against 10 unseen repositorie
 ## Installation
 
 ```bash
-# Install with Go 1.22+ (zero external dependencies)
+# Option 1: One-line binary install (macOS & Linux — no Go required)
+curl -fsSL https://raw.githubusercontent.com/humanethq/airgap-check/main/install.sh | sh
+
+# Option 2: Install directly with Go 1.22+ (zero external dependencies)
 go install github.com/humanethq/airgap-check/cmd/airgap-check@latest
 
-# Or build from source
+# Option 3: Build from source
 git clone https://github.com/humanethq/airgap-check.git
 cd airgap-check
 make build
@@ -127,6 +130,26 @@ When `--run` is invoked, `airgap-check` launches a container with **kernel-isola
 - **Language-Agnostic `UDP:53` DNS Sinkhole (`127.0.0.1:53`):** Binds `127.0.0.1:53/udp` inside the container network namespace and points `/etc/resolv.conf` to `nameserver 127.0.0.1`. Any DNS lookup—whether from Python, Node.js, Go, Rust, C/C++ native extensions (`onnxruntime`, `libcurl`), or subprocesses (`curl`, `getent`)—is recorded (`dns_udp53`) and immediately answered with `NXDOMAIN` so it fails fast and visibly.
 - **Language Socket Hooks:** Injects `sitecustomize.py` (`socket.getaddrinfo`, `socket.connect`) and `node_preload.js` (`dns.lookup`, `net.Socket.connect`) to capture socket-level metadata.
 - **Explicit Limitation:** Only code paths exercised by `--run-cmd` are dynamically tested, and raw hardcoded-IP TCP connections from static non-Python/Node binaries that bypass DNS require a custom `--internal` bridge.
+
+---
+
+## Supported Modules & Rules Reference
+
+| Category | Module / Pattern | Ecosystem | Hidden Egress Host(s) | `--fix` Remediation |
+| :--- | :--- | :--- | :--- | :--- |
+| **Runtime Model / Asset** | `tiktoken` / `tiktoken.get_encoding()` | Python | `openaipublic.blob.core.windows.net` | Pre-warms `cl100k_base` & `o200k_base` into `TIKTOKEN_CACHE_DIR` |
+| **Runtime Model / Asset** | `chromadb` (default ONNX embedding) | Python | `chroma-onnx-models.s3.amazonaws.com` | Pre-warms `ONNXMiniLM_L6_V2()` into `XDG_CACHE_HOME` |
+| **Runtime Model / Asset** | `fastembed` (`TextEmbedding()`) | Python | `huggingface.co`, `cdn-lfs.hf.co` | Pre-warms `TextEmbedding(cache_dir=...)` during build |
+| **Runtime Model / Asset** | `sentence-transformers` / `transformers` / `from_pretrained()` | Python / JS | `huggingface.co`, `cdn-lfs.hf.co` | Pre-populates `HF_HOME` + sets `HF_HUB_OFFLINE=1` & `TRANSFORMERS_OFFLINE=1` |
+| **Runtime Model / Asset** | `whisper` / `whisper.load_model()` | Python | `openaipublic.azureedge.net` | Pre-warms Whisper `.pt` checkpoint into `XDG_CACHE_HOME/whisper` |
+| **Runtime Model / Asset** | `playwright` | Python / Node | `playwright.azureedge.net` | Runs `npx playwright install --with-deps chromium` into `PLAYWRIGHT_BROWSERS_PATH` |
+| **Runtime Model / Asset** | `nltk` / `nltk.download()` | Python | `raw.githubusercontent.com` | Pre-downloads corpora into `NLTK_DATA` via `python3 -m nltk.downloader` |
+| **Runtime Model / Asset** | `spacy` / `spacy.cli.download()` | Python | `raw.githubusercontent.com` | Installs `en_core_web_sm` wheel during build |
+| **Runtime Model / Asset** | `torch.hub.load()` | Python | `github.com`, `download.pytorch.org` | Pre-populates `TORCH_HOME` during build |
+| **Build-Time Asset** | `next/font/google` | Next.js | `fonts.googleapis.com`, `fonts.gstatic.com` | Recommends `next/font/local` for offline builds |
+| **Server Telemetry** | `chromadb`, `crewai`, `langsmith`, `scarf` | Python / Node | `*.posthog.com`, `telemetry.crewai.com:4319`, `api.smith.langchain.com`, `scarf.sh` | Silences via `ANONYMIZED_TELEMETRY=False`, `CREWAI_DISABLE_TELEMETRY=true`, `OTEL_SDK_DISABLED=true`, `LANGCHAIN_TRACING_V2=false`, `SCARF_NO_ANALYTICS=true`, `DO_NOT_TRACK=1` |
+| **Browser Telemetry** | `posthog-js`, `@sentry/*` (in frontend paths) | Browser JS | `us.i.posthog.com`, `ingest.sentry.io` | Flags as `browser_client` (server `ENV` vars do not silence browser requests) |
+| **`.env` Credentials** | `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `GROQ_*`, `MISTRAL_*`, `COHERE_*`, `DEEPSEEK_*`, `TOGETHER_*`, `STRIPE_*`, `GITHUB_TOKEN`, `JWT_*`, `CLOUDINARY_*`, `AWS_SECRET*` | All | Classifies into `wire_api_key` vs `local_signing_or_internal` vs `signed_request_flow` | Audits `.env` key names & `git ls-files` status without ever reading or logging secret values |
 
 ---
 
