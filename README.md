@@ -1,8 +1,6 @@
-# Humanet airgap-check
+# ![airgap-check](docs/banner.png)
 
 Find out what your AI app downloads, or tries to reach, when the network goes away.
-
-![airgap-check](docs/banner.png)
 
 ![Go 1.22+](https://img.shields.io/badge/go-1.22+-00ADD8.svg) ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 
