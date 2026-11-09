@@ -1,4 +1,4 @@
-# airgap-check
+# Humanet airgap-check
 
 Find out what your AI app downloads, or tries to reach, when the network goes away.
 
