@@ -2,7 +2,7 @@
 set -eu
 
 REPO="humanethq/airgap-check"
-VERSION="${AIRGAP_CHECK_VERSION:-v0.2.1}"
+VERSION="${AIRGAP_CHECK_VERSION:-v0.2.2}"
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
