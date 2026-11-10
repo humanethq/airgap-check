@@ -12,11 +12,11 @@ None of this is a bug in those libraries. They download once and cache. It only 
 
 ## What it does
 
-- **Structural manifest & lockfile graph scan.** Structurally parses `requirements*.txt`, `pyproject.toml` (ignoring `[dependency-groups]`, `dev`/`test`/`lint`/`docs` groups, and extra key names), `Pipfile`, `package.json` (skipping `devDependencies`), `Cargo.toml`, `go.mod`, and `Gemfile`. Walks `uv.lock`, `poetry.lock`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, and `Cargo.lock` via BFS from production roots so transitive weight/telemetry dependencies are found with explicit scope tags (`prod`, `transitive_lockfile`, `optional_extra`).
-- **Known + universal behavioral source analysis.** Detects known runtime fetch calls (`nltk.download()`, `from_pretrained()`, `tiktoken.get_encoding()`, `whisper.load_model()`, `easyocr.Reader()`, `RapidOCR()`, `PaddleOCR()`, `FlagModel`/`FlagReranker`, `TextEmbedding()`, `next/font/google`) while respecting comments and `local_files_only=True`. Also flags unknown-library patterns generically: remote weight/archive/cost-map URLs (`.onnx`, `.safetensors`, `.gguf`, `.pth`, `model_prices_and_context_window.json`), `urlretrieve()`, runtime `subprocess`/`pip install`/`ollama pull`, Python `requests`/`urllib` calls omitting `timeout=`, and hardcoded `~/.cache` writes.
-- **Multi-runtime `--run`.** Runs your app or probe inside `docker run --rm --network none` with an isolated loopback sinkhole (`UDP:53` DNS, `TCP:443` TLS `ClientHello` SNI, `TCP:80` HTTP Host/Path with query strings stripped, plus `HTTP_PROXY` fallback) and Python/Node socket hooks — supporting both Python (`runner.py`) and pure Node.js (`runner.js`) containers without package rules.
-- **`--fix` & `.airgap-check.json`.** Prints Dockerfile lines (offline `ENV` flags and build-time pre-warming commands) tailored to detected ecosystems, and lets repositories extend or suppress rules via `.airgap-check.json` or `--rules`.
-- **`.env` key classification.** Inspects `.env*` key names and `git ls-files` status only; secret values are never read or logged.
+- **Manifest & lockfile scan.** Inspects `requirements*.txt`, `pyproject.toml`, `Pipfile`, `package.json`, `Cargo.toml`, `go.mod`, and `Gemfile` (skipping `devDependencies`, `[dependency-groups]`, and `dev`/`test`/`lint`/`docs` groups), and follows lockfiles (`uv.lock`, `poetry.lock`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `Cargo.lock`) from production roots with explicit scope tags (`prod`, `transitive_lockfile`, `optional_extra`). Reads these files with a built-in minimal TOML/YAML reader (no external parser), so unusual formatting may be missed.
+- **Source patterns & heuristics.** Flags known runtime fetch calls (`nltk.download()`, `from_pretrained()`, `tiktoken.get_encoding()`, `whisper.load_model()`, `easyocr.Reader()`, `RapidOCR()`, `PaddleOCR()`, `FlagModel`/`FlagReranker`, `TextEmbedding()`, `next/font/google`) while ignoring comments and `local_files_only=True`, plus generic asset URLs (`.onnx`, `.safetensors`, `.gguf`, `model_prices_and_context_window.json`), `urlretrieve()`, runtime `pip install`/`ollama pull`, and `~/.cache` writes. Missing HTTP `timeout=` calls are reported separately as advisory `robustness_hints`.
+- **Python and Node `--run`.** Runs your app or probe inside `docker run --rm --network none` with a loopback sinkhole (`UDP:53` DNS, `TCP:443` TLS SNI, `TCP:80` HTTP Host/Path with query strings stripped, `HTTP_PROXY` fallback) and Python/Node socket hooks.
+- **`--fix` & custom rules.** Prints Dockerfile `ENV` flags and pre-warming commands, and supports repo overrides via `.airgap-check.json` or `--rules`.
+- **`.env` keys.** Classifies `.env*` key names and `git ls-files` status only; secret values are never read or logged.
 
 Go standard library only. `--run` requires Docker.
 
@@ -117,9 +117,9 @@ Limits:
 
 ## Benchmark
 
-We ran airgap-check on 20 open-source Python and TypeScript AI repositories in two phases. Phase 1 (10 repos) was used to find failure modes and tune the rules. Phase 2 (10 repos) is a held-out set: the rules were frozen at commit `8ce2f11` before we ran it.
+We evaluated airgap-check on 30 open-source Python and TypeScript AI repositories across three phases: Phase 1 (10 calibration repos), Phase 2 (10 held-out repos scored with `v0.1.0` rules frozen at `8ce2f11`, then re-used to design `v0.2.0`), and Phase 3 (10 fresh held-out repos scored strictly out-of-sample with `v0.2.1` rules frozen at `47b2ddc`).
 
-These are probe-based tests: we did not start the applications themselves. Under `--network none`, we executed probe calls exercising the specific library functions flagged by the static scan (for example, `tiktoken.get_encoding('cl100k_base')` for `gpt-engineer`, ChromaDB collection creation and insertion for `mem0` and `vanna`, Hugging Face model resolution for `docling` and `quivr`, and a baseline probe for `chat-langchain`). Exact probe commands, upstream URLs, and commit SHAs are documented in [`benchmark/REPOS.md`](benchmark/REPOS.md).
+These are probe-based tests: we did not start the applications themselves. A “true positive” means the flagged library fetches something when its call runs offline (or executes a runtime installer/download); it does not prove the repository reaches that call in normal operation. Telemetry findings (for example langsmith, posthog or sentry) and advisory `robustness_hints` (`timeout=` omissions) are not scored in precision/recall. Exact probe commands, upstream URLs, and commit SHAs are documented in [`benchmark/REPOS.md`](benchmark/REPOS.md).
 
 ### What the libraries do offline
 
@@ -134,9 +134,9 @@ These are probe-based tests: we did not start the applications themselves. Under
 | `litellm` | Fetches its model price map at startup unless `LITELLM_LOCAL_MODEL_COST_MAP=True` | `raw.githubusercontent.com` | fallback warning |
 | `crewai`, `chromadb` | Background telemetry threads on startup unless disabled | `telemetry.crewai.com:4319`, `us.i.posthog.com` | background timeouts |
 
-Times were measured in a container with no network and an immediately refusing DNS sinkhole (see limits above). Browser-side telemetry, such as `posthog-js` in a frontend bundle, is a separate case: server environment variables do not silence it, because the requests leave from the user's browser.
+Timings in the table above were measured with `v0.1.0` (immediate `NXDOMAIN`); `v0.2.0+` defaults to `sinkhole` mode (`127.0.0.1`), where connections reach a local loopback TLS/HTTP listener first and hit handshake/socket errors instead of immediate DNS errors, which changes retry behaviour across HTTP clients (for example, `huggingface_hub` on `smolagents` exited in `293 ms` under `sinkhole` vs `477 ms` under `--dns-action nxdomain`). Browser-side telemetry, such as `posthog-js` in a frontend bundle, is a separate case: server environment variables do not silence it, because the requests leave from the user's browser.
 
-### Held-out results (10 repos, rules frozen)
+### Phase 2 held-out results (v0.1.0, rules frozen at `8ce2f11`)
 
 | Repository | Probe result under `--network none` | TP | FP | FN |
 | :--- | :--- | :-: | :-: | :-: |
@@ -151,23 +151,43 @@ Times were measured in a container with no network and an immediately refusing D
 | `pydantic-ai` | exit 1 (`tiktoken`) | 3 | 2 | 0 |
 | `chat-langchain` | exit 0, no asset downloads | – | 0 | 0 |
 
-These are probe-based tests: we did not start the applications themselves. A “true positive” means the flagged library fetches something when its call runs offline; it does not prove the repository reaches that call in normal operation. Telemetry findings (for example langsmith, posthog or sentry in several repos) are not scored in the metrics below.
+At component level (`v0.1.0`): 35 true positives, 4 false positives, 5 false negatives. That is 89.7% precision and 87.5% recall. This is a small sample, so treat the numbers as rough. At repository level, all 9 repositories with first-use downloads were flagged, and `chat-langchain` was correctly flagged as clean.
 
-At component level: 35 true positives, 4 false positives, 5 false negatives. That is 89.7% precision and 87.5% recall. This is a small sample, so treat the numbers as rough. At repository level, all 9 repositories with first-use downloads were flagged, and `chat-langchain` was correctly flagged as clean.
+False positives (all 4 in `v0.1.0`): `pyproject.toml` was scanned as plain text, so dev and test dependency groups (`playwright` in `docling`, `litellm`, `pydantic-ai`) and an optional extra named `posthog` triggered warnings.
 
-False positives (all 4 in v0.1.0): `pyproject.toml` was scanned as plain text, so dev and test dependency groups (`playwright` in `docling`, `litellm`, `pydantic-ai`) and an optional extra named `posthog` triggered warnings.
+False negatives (all 5 in `v0.1.0`): OCR weight downloaders (`easyocr`, `rapidocr`, `paddleocr`), `FlagEmbedding`, and LiteLLM's startup fetch of `model_prices_and_context_window.json` were not in the frozen `v0.1.0` rule table.
 
-False negatives (all 5 in v0.1.0): OCR weight downloaders (`easyocr`, `rapidocr`, `paddleocr`), `FlagEmbedding`, and LiteLLM's startup fetch of `model_prices_and_context_window.json` were not in the frozen rule table.
+### v0.2.0 design fixes (same Phase 2 commits, not out-of-sample)
 
-### What changed in v0.2.0 (re-run on the same pinned commits)
+> These 10 Phase 2 repositories were used to design the `v0.2.0` fixes, so re-run numbers on them are no longer out-of-sample. See the fresh Phase 3 held-out set below for out-of-sample `v0.2.1` validation.
 
-Re-running `v0.2.0` on the exact same 10 held-out commits:
+- Addresses all 4 `v0.1.0` dev-group / key-name false positives (`0` dev/lint/key-name false positives; optional extras such as `format-html-render` in `docling` or `[extra: playwright]` in `pydantic_ai_harness` are tagged explicitly as `optional_extra` rather than `prod`).
+- Addresses the 5 `v0.1.0` false negatives (`FlagEmbedding`, `paddleocr`, `easyocr`, `rapidocr`, and `litellm`'s startup `model_prices_and_context_window.json` fetch — the latter caught generically by the behavioral URL scanner without requiring a package rule).
+- Surfaces transitive air-gap dependencies via lockfile traversal (`huggingface-hub` via `datasets` in `gpt-engineer`'s `poetry.lock`, `spacy` and `rapidocr` via `uv.lock` in `llama_index`, `@huggingface/transformers` via `pnpm-lock.yaml` in `mem0`, `tiktoken` via `uv.lock` in `pydantic-ai`).
 
-- Eliminates all 4 v0.1.0 dev-group / key-name false positives (`0` dev/lint/key-name false positives; optional extras such as `format-html-render` in `docling` or `[extra: playwright]` in `pydantic_ai_harness` are tagged explicitly as `optional_extra` rather than `prod`).
-- Closes all 5 v0.1.0 false negatives (`FlagEmbedding`, `paddleocr`, `easyocr`, `rapidocr`, and `litellm`'s startup `model_prices_and_context_window.json` fetch — the latter caught generically by the behavioral URL scanner without requiring a package rule).
-- Surfaces transitive air-gap dependencies via lockfile BFS (`huggingface-hub` via `datasets` in `gpt-engineer`'s `poetry.lock`, `spacy` and `rapidocr` via `uv.lock` in `llama_index`, `@huggingface/transformers` via `pnpm-lock.yaml` in `mem0`, `tiktoken` via `uv.lock` in `pydantic-ai`) and runtime `pip install` / `ollama pull` subprocess calls (`gpt-researcher`, `litellm`, `mem0`).
+### Phase 3 held-out results (v0.2.1, rules frozen at `47b2ddc`)
 
-Per-repository v0.2.0 scan timings and detailed breakdowns (0.01 s – 3.40 s across the 10 held-out repos, including 715 manifests / 602 lockfiles in `llama_index` in 1.65 s and 5,732 source files in `litellm` in 3.40 s) are recorded in [`benchmark/REPOS.md`](benchmark/REPOS.md).
+To measure `v0.2.1` strictly out-of-sample, we froze all detection rules at commit `47b2ddc` before cloning 10 previously unseen AI repositories (`0.02 s` – `0.59 s` per scan):
+
+| Repository | Probe result under `--network none` (`sinkhole`) | TP | FP | FN |
+| :--- | :--- | :-: | :-: | :-: |
+| `smolagents` | exit 1 (`huggingface.co`, 293 ms) | 6 | 1 | 0 |
+| `crawl4ai` | exit 1 (`raw.githubusercontent.com`, `openaipublic.blob.core.windows.net`, 345 ms) | 10 | 0 | 2 |
+| `aider` | exit 1 (`openaipublic.blob.core.windows.net`, 358 ms) | 7 | 0 | 1 |
+| `open-webui` | exit 1 (`chroma-onnx-models.s3.amazonaws.com`, 557 ms) | 14 | 0 | 2 |
+| `browser-use` | exit 1 (`openaipublic.blob.core.windows.net`, 212 ms) | 1 | 0 | 0 |
+| `markitdown` | exit 0, no runtime downloads (163 ms; `magika` bundles weights locally) | 0 | 0 | 0 |
+| `crewAI` | exit 1 (`chroma-onnx-models.s3.amazonaws.com`, 592 ms) | 13 | 3 | 2 |
+| `openai-agents-python` | exit 0, core runtime clean (419 ms; `[extra: litellm]` flagged) | 1 | 0 | 0 |
+| `servers` | exit 0, no runtime downloads (153 ms, `node:20-bookworm-slim`) | 0 | 0 | 0 |
+| `instructor` | exit 0, core runtime clean (417 ms; `[extra: litellm]` flagged) | 1 | 0 | 0 |
+
+At finding level (`v0.2.1`, out-of-sample): **53 true positives, 4 false positives, 7 false negatives** (**93.0% precision**, **88.3% recall**). All 8 repositories containing runtime downloaders or optional-extra downloads were flagged (while dev-only `playwright==1.63.0` inside `openai-agents-python`'s `[dependency-groups] dev` produced 0 false positives), and both clean repositories (`markitdown`, `servers`) were flagged clean. Separating missing `timeout=` calls out of `behavioral_findings` into advisory `robustness_hints` prevented 37 HTTP-timeout hints (`26` in `open-webui` alone) from dropping out-of-sample precision from 93.0% to 56.4%.
+
+- **False positives (4)**: `smolagents` matched a docstring example (`>>> tokenizer = AutoTokenizer.from_pretrained(...)` in `_function_type_hints_utils.py`); `crewAI` matched Vertex AI SDK's `TextEmbeddingModel.from_pretrained(...)` (`genai_vertex_embedding.py`), a private maintenance script (`lib/devtools/src/crewai_devtools/litellm_catalog_update.py`), and `arxiv_paper_tool.py`'s user-triggered `urlretrieve(pdf_url)`.
+- **False negatives (7)**: `crawl4ai/model_loader.py` has a multi-line `subprocess.run(["git", "clone", ...])` call (line-by-line regex missed it) and `spacy.load()`; `aider/models.py` splits `model_prices_and_context_window.json` across two adjacent string literals (though `litellm` in `requirements.txt` surfaced the host); `open-webui` missed `spacy` transitively under `unstructured` in `uv.lock` and `kokoro-js` in `package.json` (`kokoro.worker.ts` `from_pretrained()` was caught); `crewAI` missed `docling` (`[extra: docling]` + `DocumentConverter()`) and `spacy` under optional extras. Also note: `aider` maps `requirements-help.txt` and `requirements-playwright.txt` via `[tool.setuptools.dynamic.optional-dependencies]`, so the minimal TOML reader tagged those 4 extras as `prod` rather than `optional_extra`, and `browser-use` implements PostHog telemetry via raw stdlib `urllib` rather than the `posthog` PyPI package (unscored).
+
+Per-repository SHAs, manifests, lockfiles, scan durations, and probe transcripts are recorded in [`benchmark/REPOS.md`](benchmark/REPOS.md).
 
 ## Supported checks
 
@@ -185,7 +205,8 @@ Per-repository v0.2.0 scan timings and detailed breakdowns (0.01 s – 3.40 s ac
 | Runtime download | `nltk.download()`, `spacy.cli.download()` | `raw.githubusercontent.com` | pre-downloads corpora / model wheel at build time |
 | Runtime download | `torch.hub.load()`, `timm`, `ultralytics`, `unstructured`, `surya-ocr`, `docling-ibm-models`, `kokoro` | `github.com`, `download.pytorch.org`, `huggingface.co` | flagged + `TORCH_HOME` / `HF_HOME` setup |
 | Build-time download | `next/font/google` | `fonts.googleapis.com`, `fonts.gstatic.com` | flagged only; suggests `next/font/local` |
-| Behavioral heuristics | Remote `.onnx`/`.safetensors`/`.gguf`/cost-map URLs, `urlretrieve()`, archive fetch+unpack, runtime `subprocess` (`pip install`, `curl`, `wget`, `ollama pull`), Python HTTP calls omitting `timeout=`, hardcoded `~/.cache` writes | dynamic / inferred hosts | hints detected hosts & explicit `timeout=(2, 10)` action |
+| Behavioral heuristics | Remote `.onnx`/`.safetensors`/`.gguf`/cost-map URLs, `urlretrieve()`, archive fetch+unpack, runtime `subprocess` (`pip install`, `curl`, `wget`, `ollama pull`), hardcoded `~/.cache` writes | dynamic / inferred hosts | hints detected hosts |
+| Robustness hints (advisory) | Python `requests`/`urllib` HTTP calls omitting `timeout=` | — | separated into `robustness_hints`; suggests `timeout=(2, 10)` |
 | Server telemetry | `chromadb`, `crewai`, `langsmith`, `langfuse`, `wandb`, `opentelemetry-exporter-otlp`, `ddtrace`, `gradio`, `scarf` | PostHog, `telemetry.crewai.com`, `api.smith.langchain.com`, `cloud.langfuse.com`, `api.wandb.ai`, Datadog, `api.gradio.app`, `scarf.sh` | sets the matching disable flags |
 | Browser telemetry | `posthog-js`, `@sentry/*`, frontend `langsmith` | PostHog, Sentry, LangSmith | flagged only; disable the SDK in your frontend code |
 | `.env` keys | `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `STRIPE_*`, `JWT_*`, `CLOUDINARY_*`, `AWS_SECRET*` and others | n/a | flagged only; classifies key names and git tracking status |
