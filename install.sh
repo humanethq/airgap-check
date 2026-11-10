@@ -2,7 +2,7 @@
 set -eu
 
 REPO="humanethq/airgap-check"
-VERSION="${AIRGAP_CHECK_VERSION:-v0.1.0}"
+VERSION="${AIRGAP_CHECK_VERSION:-v0.2.0}"
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
@@ -42,4 +42,4 @@ fi
 
 install -m 0755 "${TMP_DIR}/airgap-check" "${INSTALL_DIR}/airgap-check"
 echo "Installed airgap-check to ${INSTALL_DIR}/airgap-check"
-"${INSTALL_DIR}/airgap-check" -h 2>&1 | head -n 8 || true
+"${INSTALL_DIR}/airgap-check" --version

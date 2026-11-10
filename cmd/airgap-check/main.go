@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -16,341 +15,81 @@ import (
 	"time"
 )
 
-const defaultHermeticRuntimeEnv = "DO_NOT_TRACK=1 NEXT_TELEMETRY_DISABLED=1 ANONYMIZED_TELEMETRY=False SCARF_NO_ANALYTICS=true HF_HUB_DISABLE_TELEMETRY=1 LANGCHAIN_TRACING_V2=false CREWAI_DISABLE_TELEMETRY=true OTEL_SDK_DISABLED=true STREAMLIT_BROWSER_GATHER_USAGE_STATS=false XDG_CACHE_HOME=/app/.cache TIKTOKEN_CACHE_DIR=/app/.cache/tiktoken HF_HOME=/app/.cache/huggingface"
-
-// EnvFileScopeInfo records an inspected .env file and whether it is tracked in git.
-type EnvFileScopeInfo struct {
-	RelPath    string `json:"rel_path"`
-	GitTracked bool   `json:"git_tracked"`
-}
-
-// CheckScope explicitly states what was and was not tested during `airgap-check`.
-type CheckScope struct {
-	Mode               string             `json:"mode"`
-	InspectedManifests []string           `json:"inspected_manifests"`
-	InspectedEnvFiles  []EnvFileScopeInfo `json:"inspected_env_files"`
-	ScannedSourceFiles int                `json:"scanned_source_files"`
-	LimitationsNote    string             `json:"limitations_note"`
-}
-
-// CheckRiskFinding describes a static or runtime air-gap / telemetry / egress risk.
-type CheckRiskFinding struct {
-	Category         string   `json:"category"`
-	Severity         string   `json:"severity"`
-	Component        string   `json:"component"`
-	SourceFile       string   `json:"source_file"`
-	ExecutionContext string   `json:"execution_context"`
-	EgressHosts      []string `json:"egress_hosts,omitempty"`
-	FailureImpact    string   `json:"failure_impact"`
-	Mitigation       string   `json:"mitigation"`
-	AutoSealedByEnv  bool     `json:"auto_sealed_by_env"`
-}
-
-// SecretRecommendation classifies an environment key by how it is used on the wire vs locally.
-type SecretRecommendation struct {
-	SecretKey        string   `json:"secret_key"`
-	SourceFile       string   `json:"source_file"`
-	GitTracked       bool     `json:"git_tracked"`
-	UsageKind        string   `json:"usage_kind"` // "wire_api_key", "local_signing_or_internal", "signed_request_flow", "needs_review"
-	ProxyEligible    bool     `json:"proxy_eligible"`
-	Explanation      string   `json:"explanation"`
-	RecommendedHosts []string `json:"recommended_hosts,omitempty"`
-	Guidance         string   `json:"guidance,omitempty"`
-}
-
-// EgressManifestEntry summarizes a referenced or dynamically observed external host.
-type EgressManifestEntry struct {
-	Host           string `json:"host"`
-	Source         string `json:"source"`
-	Classification string `json:"classification"`
-	PolicyAction   string `json:"policy_action"`
-}
-
-// CheckReport is the calibrated output of `airgap-check [path]`.
-type CheckReport struct {
-	TargetPath                   string                 `json:"target_path"`
-	Scope                        CheckScope             `json:"scope"`
-	AirgapCrashRisks             []CheckRiskFinding     `json:"airgap_crash_risks"`
-	TelemetryLeakRisks           []CheckRiskFinding     `json:"telemetry_leak_risks"`
-	EgressAndSecretRisks         []CheckRiskFinding     `json:"egress_and_secret_risks"`
-	AllowedEgressManifest        []EgressManifestEntry  `json:"allowed_egress_manifest"`
-	SecretRecommendations        []SecretRecommendation `json:"secret_recommendations"`
-	HermeticBuildEnv             []string               `json:"hermetic_build_env"`
-	RemediationDockerfileSnippet string                 `json:"remediation_dockerfile_snippet,omitempty"`
-	DynamicRun                   *DynamicCheckResult    `json:"dynamic_run,omitempty"`
-	AirgapReadinessVerdict       string                 `json:"airgap_readiness_verdict"`
-}
-
-type knownPackageRule struct {
-	matchSubstr string
-	component   string
-	category    string
-	severity    string
-	pythonOnly  bool
-	hosts       []string
-	impact      string
-	mitigation  string
-	autoSealed  bool
-}
-
-var knownAirgapAndTelemetryRules = []knownPackageRule{
-	{
-		matchSubstr: "tiktoken",
-		component:   "tiktoken",
-		category:    "runtime_model_asset",
-		severity:    "CRITICAL",
-		pythonOnly:  true,
-		hosts:       []string{"openaipublic.blob.core.windows.net"},
-		impact:      "Python tiktoken downloads cl100k_base/o200k_base BPE encodings over HTTPS on first call; crashes with ConnectionError in --network none.",
-		mitigation:  "Pre-warm cl100k_base & o200k_base into TIKTOKEN_CACHE_DIR during image build (see `--fix` Dockerfile snippet).",
-		autoSealed:  false,
-	},
-	{
-		matchSubstr: "chromadb",
-		component:   "chromadb (default ONNX embedding)",
-		category:    "runtime_model_asset",
-		severity:    "CRITICAL",
-		pythonOnly:  true,
-		hosts:       []string{"chroma-onnx-models.s3.amazonaws.com"},
-		impact:      "Calling collection.add() with the default embedding function downloads all-MiniLM-L6-v2 ONNX weights from chroma-onnx-models.s3.amazonaws.com; crashes with ConnectError in --network none.",
-		mitigation:  "Pass an explicit offline/local embedding_function or pre-populate ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2 during build (see `--fix`).",
-		autoSealed:  false,
-	},
-	{
-		matchSubstr: "fastembed",
-		component:   "fastembed",
-		category:    "runtime_model_asset",
-		severity:    "CRITICAL",
-		pythonOnly:  true,
-		hosts:       []string{"huggingface.co", "cdn-lfs.hf.co"},
-		impact:      "TextEmbedding() hangs for ~39s (3s+9s+27s retry backoff) attempting to download ONNX models from HuggingFace/GCS before crashing with ValueError in --network none.",
-		mitigation:  "Pre-populate fastembed cache_dir during image build and pass local_files_only=True (see `--fix`).",
-		autoSealed:  false,
-	},
-	{
-		matchSubstr: "sentence-transformers",
-		component:   "sentence-transformers",
-		category:    "runtime_model_asset",
-		severity:    "CRITICAL",
-		hosts:       []string{"huggingface.co", "cdn-lfs.hf.co"},
-		impact:      "Fetches embedding weights and tokenizer configs from HuggingFace Hub at runtime; fails with ConnectionError in offline networks.",
-		mitigation:  "Pre-download model weights into HF_HOME during build and set HF_HUB_OFFLINE=1 (see `--fix`).",
-		autoSealed:  false,
-	},
-	{
-		matchSubstr: "transformers",
-		component:   "transformers",
-		category:    "runtime_model_asset",
-		severity:    "CRITICAL",
-		hosts:       []string{"huggingface.co", "cdn-lfs.hf.co"},
-		impact:      "Calls huggingface.co API (5 retries with exponential backoff) for model/tokenizer metadata on startup unless local_files_only=True and weights are cached.",
-		mitigation:  "Pre-populate HF_HOME during build and set TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 (see `--fix`).",
-		autoSealed:  false,
-	},
-	{
-		matchSubstr: "whisper",
-		component:   "whisper",
-		category:    "runtime_model_asset",
-		severity:    "CRITICAL",
-		hosts:       []string{"openaipublic.azureedge.net"},
-		impact:      "Downloads Whisper .pt checkpoints at runtime into ~/.cache/whisper.",
-		mitigation:  "Pre-download Whisper model checkpoints into XDG_CACHE_HOME/whisper during build (see `--fix`).",
-		autoSealed:  false,
-	},
-	{
-		matchSubstr: "spacy",
-		component:   "spacy",
-		category:    "runtime_model_asset",
-		severity:    "HIGH",
-		hosts:       []string{"raw.githubusercontent.com"},
-		impact:      "spacy.cli.download fetches language pipelines at runtime if not installed as a wheel in requirements.txt.",
-		mitigation:  "Pin the spacy model wheel URL in requirements.txt or run `python3 -m spacy download` during build (see `--fix`).",
-		autoSealed:  false,
-	},
-	{
-		matchSubstr: "nltk",
-		component:   "nltk",
-		category:    "runtime_model_asset",
-		severity:    "HIGH",
-		hosts:       []string{"raw.githubusercontent.com"},
-		impact:      "nltk.download() fetches corpora over GitHub raw URLs at runtime; fails with ValueError/URLError in --network none.",
-		mitigation:  "Pre-download NLTK_DATA into the image during build via `python3 -m nltk.downloader` (see `--fix`).",
-		autoSealed:  false,
-	},
-	{
-		matchSubstr: "playwright",
-		component:   "playwright",
-		category:    "runtime_model_asset",
-		severity:    "CRITICAL",
-		hosts:       []string{"playwright.azureedge.net"},
-		impact:      "Requires headless browser binaries (chromium/firefox/webkit) downloaded from playwright.azureedge.net; fails at launch if missing.",
-		mitigation:  "Run `playwright install --with-deps chromium` with PLAYWRIGHT_BROWSERS_PATH during image build (see `--fix`).",
-		autoSealed:  false,
-	},
-	{
-		matchSubstr: "chromadb",
-		component:   "chromadb",
-		category:    "telemetry_analytics",
-		severity:    "HIGH",
-		hosts:       []string{"us.i.posthog.com", "eu.i.posthog.com"},
-		impact:      "ChromaDB client/server emits PostHog telemetry events by default unless ANONYMIZED_TELEMETRY=False is set.",
-		mitigation:  "Set ANONYMIZED_TELEMETRY=False and CHROMA_TELEMETRY_IMPL=none in container ENV.",
-		autoSealed:  true,
-	},
-	{
-		matchSubstr: "crewai",
-		component:   "crewai",
-		category:    "telemetry_analytics",
-		severity:    "HIGH",
-		hosts:       []string{"telemetry.crewai.com"},
-		impact:      "CrewAI spawns background OTLP threads connecting to telemetry.crewai.com:4319 unless disabled.",
-		mitigation:  "Set CREWAI_DISABLE_TELEMETRY=true and OTEL_SDK_DISABLED=true in container ENV.",
-		autoSealed:  true,
-	},
-	{
-		matchSubstr: "posthog",
-		component:   "posthog",
-		category:    "telemetry_analytics",
-		severity:    "MEDIUM",
-		hosts:       []string{"us.i.posthog.com", "app.posthog.com"},
-		impact:      "Sends usage analytics to PostHog endpoints.",
-		mitigation:  "If used in browser (posthog-js), requests leave from the end-user's browser and server env vars do NOT disable it; disable posthog.init() in client code for offline deployments.",
-		autoSealed:  false,
-	},
-	{
-		matchSubstr: "sentry",
-		component:   "sentry-sdk",
-		category:    "telemetry_analytics",
-		severity:    "MEDIUM",
-		hosts:       []string{"ingest.sentry.io", "sentry.io"},
-		impact:      "Ships stack traces and local context to Sentry ingest servers when a DSN is configured.",
-		mitigation:  "Leave SENTRY_DSN unset in offline/regulated deployments or block *.sentry.io at the egress proxy.",
-		autoSealed:  false,
-	},
-	{
-		matchSubstr: "langsmith",
-		component:   "langsmith",
-		category:    "telemetry_analytics",
-		severity:    "HIGH",
-		hosts:       []string{"api.smith.langchain.com"},
-		impact:      "Uploads LLM prompts and completions to LangSmith cloud when LANGCHAIN_TRACING_V2 is enabled.",
-		mitigation:  "Set LANGCHAIN_TRACING_V2=false in container ENV.",
-		autoSealed:  true,
-	},
-	{
-		matchSubstr: "scarf",
-		component:   "scarf",
-		category:    "telemetry_analytics",
-		severity:    "LOW",
-		hosts:       []string{"scarf.sh"},
-		impact:      "Reports package import/install telemetry to scarf.sh.",
-		mitigation:  "Set SCARF_NO_ANALYTICS=true and DO_NOT_TRACK=1 in container ENV.",
-		autoSealed:  true,
-	},
-}
-
-type sourceCodePatternRule struct {
-	re         *regexp.Regexp
-	component  string
-	category   string
-	severity   string
-	hosts      []string
-	impact     string
-	mitigation string
-	autoSealed bool
-}
-
-var sourceCodeDownloadRules = []sourceCodePatternRule{
-	{
-		re:         regexp.MustCompile(`\bnltk\.download\s*\(`),
-		component:  "nltk.download()",
-		category:   "runtime_model_asset",
-		severity:   "CRITICAL",
-		hosts:      []string{"raw.githubusercontent.com"},
-		impact:     "Explicit nltk.download() call in source code attempts an outbound HTTPS fetch to GitHub raw URLs at runtime.",
-		mitigation: "Move nltk.download() to the Dockerfile build stage and set NLTK_DATA.",
-		autoSealed: false,
-	},
-	{
-		re:         regexp.MustCompile(`\bspacy\.cli\.download\s*\(`),
-		component:  "spacy.cli.download()",
-		category:   "runtime_model_asset",
-		severity:   "CRITICAL",
-		hosts:      []string{"raw.githubusercontent.com"},
-		impact:     "Explicit spacy.cli.download() call in source code invokes pip/HTTP download at runtime.",
-		mitigation: "Install the spacy model wheel during image build instead of calling spacy.cli.download() at runtime.",
-		autoSealed: false,
-	},
-	{
-		re:         regexp.MustCompile(`\b(?:from_pretrained|hf_hub_download|snapshot_download)\s*\(`),
-		component:  "huggingface_hub.from_pretrained/download",
-		category:   "runtime_model_asset",
-		severity:   "CRITICAL",
-		hosts:      []string{"huggingface.co", "cdn-lfs.hf.co"},
-		impact:     "Calls HuggingFace Hub over HTTPS to check/download model weights unless local_files_only=True and weights exist locally.",
-		mitigation: "Pre-bake model weights into HF_HOME during build and set HF_HUB_OFFLINE=1.",
-		autoSealed: false,
-	},
-	{
-		re:         regexp.MustCompile(`\btorch\.hub\.load\s*\(`),
-		component:  "torch.hub.load()",
-		category:   "runtime_model_asset",
-		severity:   "CRITICAL",
-		hosts:      []string{"github.com", "download.pytorch.org"},
-		impact:     "Downloads PyTorch repository code and checkpoints over HTTPS at runtime.",
-		mitigation: "Pre-populate TORCH_HOME in the container image during build.",
-		autoSealed: false,
-	},
-	{
-		re:         regexp.MustCompile(`\bwhisper\.load_model\s*\(`),
-		component:  "whisper.load_model()",
-		category:   "runtime_model_asset",
-		severity:   "CRITICAL",
-		hosts:      []string{"openaipublic.azureedge.net"},
-		impact:     "Downloads Whisper model checkpoint from openaipublic.azureedge.net if not present in cache.",
-		mitigation: "Pre-download the .pt model during build and pass download_root to whisper.load_model().",
-		autoSealed: false,
-	},
-	{
-		re:         regexp.MustCompile(`\btiktoken\.(?:get_encoding|encoding_for_model)\s*\(`),
-		component:  "tiktoken.get_encoding()",
-		category:   "runtime_model_asset",
-		severity:   "CRITICAL",
-		hosts:      []string{"openaipublic.blob.core.windows.net"},
-		impact:     "Downloads BPE encoding file from openaipublic.blob.core.windows.net on first call if TIKTOKEN_CACHE_DIR is unpopulated.",
-		mitigation: "Pre-warm cl100k_base & o200k_base into TIKTOKEN_CACHE_DIR at build time (see `--fix`).",
-		autoSealed: false,
-	},
-}
+var version = "v0.2.0-dev"
 
 var (
 	httpsURLRegex = regexp.MustCompile(`https?://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(?::[0-9]+)?(/[^\s"'` + "`" + `)]*)?`)
 	envKeyRegex   = regexp.MustCompile(`^\s*(?:export\s+)?([A-Z][A-Z0-9_]{2,})\s*=\s*(.+)$`)
 )
 
+// normalizeCLIArgs reorders flags before positional arguments so invocations like
+// `airgap-check /path/to/repo --json --fix` work identically to `airgap-check --json --fix /path/to/repo`.
+func normalizeCLIArgs(raw []string) []string {
+	valueFlags := map[string]bool{
+		"-image": true, "--image": true,
+		"-run-cmd": true, "--run-cmd": true,
+		"-timeout": true, "--timeout": true,
+		"-dns-action": true, "--dns-action": true,
+		"-rules": true, "--rules": true,
+	}
+	var flagsPart, posPart []string
+	for i := 0; i < len(raw); i++ {
+		arg := raw[i]
+		if arg == "--" {
+			posPart = append(posPart, raw[i+1:]...)
+			break
+		}
+		if strings.HasPrefix(arg, "-") && arg != "-" {
+			flagsPart = append(flagsPart, arg)
+			if valueFlags[arg] && !strings.Contains(arg, "=") && i+1 < len(raw) {
+				i++
+				flagsPart = append(flagsPart, raw[i])
+			}
+			continue
+		}
+		posPart = append(posPart, arg)
+	}
+	return append(flagsPart, posPart...)
+}
+
 func main() {
 	var (
 		jsonOutput  bool
 		dynamicRun  bool
 		showFix     bool
+		buildImage  bool
+		showVersion bool
 		dockerImage string
 		runCmd      string
 		timeoutSec  int
+		dnsAction   string
+		rulesPath   string
 	)
-	flag.BoolVar(&jsonOutput, "json", false, "Output audit report in JSON format")
-	flag.BoolVar(&dynamicRun, "run", false, "Run dynamic air-gap verification inside `docker run --rm --network none` and capture UDP:53 DNS/TCP attempts")
-	flag.BoolVar(&showFix, "fix", false, "Print a ready-to-paste Dockerfile snippet (ENV + build-time pre-warming RUN lines) to seal the repository")
-	flag.StringVar(&dockerImage, "image", "", "Docker image to use with --run (defaults to detected ecosystem base image)")
-	flag.StringVar(&runCmd, "run-cmd", "", "Custom command to execute inside the --network none container with --run")
-	flag.IntVar(&timeoutSec, "timeout", 45, "Timeout in seconds for --run dynamic execution")
-	flag.Parse()
 
-	target := "."
-	if flag.NArg() > 0 {
-		target = flag.Arg(0)
+	fs := flag.NewFlagSet("airgap-check", flag.ExitOnError)
+	fs.BoolVar(&jsonOutput, "json", false, "Output audit report in JSON format")
+	fs.BoolVar(&dynamicRun, "run", false, "Run dynamic air-gap verification inside `docker run --rm --network none` and capture DNS/TLS SNI/HTTP attempts")
+	fs.BoolVar(&showFix, "fix", false, "Print a ready-to-paste Dockerfile snippet (ENV + build-time pre-warming RUN lines)")
+	fs.BoolVar(&buildImage, "build", false, "Auto-build a temporary image from the repo's Dockerfile when --run is used without --image")
+	fs.StringVar(&dockerImage, "image", "", "Docker image to use with --run (defaults to detected ecosystem base image)")
+	fs.StringVar(&runCmd, "run-cmd", "", "Custom command to execute inside the --network none container with --run")
+	fs.IntVar(&timeoutSec, "timeout", 45, "Timeout in seconds for --run dynamic execution")
+	fs.StringVar(&dnsAction, "dns-action", "sinkhole", "UDP:53 sinkhole behavior under --run: 'sinkhole' (return 127.0.0.1 for TLS SNI/HTTP capture) or 'nxdomain'")
+	fs.StringVar(&rulesPath, "rules", "", "Optional path to custom JSON rules file (default: auto-loads .airgap-check.json in repo root)")
+	fs.BoolVar(&showVersion, "version", false, "Print airgap-check version and exit")
+	_ = fs.Parse(normalizeCLIArgs(os.Args[1:]))
+
+	if showVersion {
+		fmt.Printf("airgap-check %s\n", version)
+		return
 	}
 
-	report, err := AnalyzeProjectAirgapAndEgress(target)
+	target := "."
+	if fs.NArg() > 0 {
+		target = fs.Arg(0)
+	}
+
+	report, err := AnalyzeProjectAirgapAndEgressWithRules(target, rulesPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "airgap-check error: %v\n", err)
 		os.Exit(1)
@@ -360,9 +99,13 @@ func main() {
 			context.Background(),
 			report.TargetPath,
 			report,
-			dockerImage,
-			runCmd,
-			time.Duration(timeoutSec)*time.Second,
+			DynamicRunOptions{
+				DockerImage:     dockerImage,
+				RunCmd:          runCmd,
+				Timeout:         time.Duration(timeoutSec) * time.Second,
+				DnsAction:       dnsAction,
+				BuildDockerfile: buildImage,
+			},
 		)
 		if dynErr != nil {
 			fmt.Fprintf(os.Stderr, "airgap-check --run error: %v\n", dynErr)
@@ -380,6 +123,10 @@ func main() {
 }
 
 func AnalyzeProjectAirgapAndEgress(targetDir string) (*CheckReport, error) {
+	return AnalyzeProjectAirgapAndEgressWithRules(targetDir, "")
+}
+
+func AnalyzeProjectAirgapAndEgressWithRules(targetDir, customRulesPath string) (*CheckReport, error) {
 	absPath, err := filepath.Abs(targetDir)
 	if err != nil {
 		return nil, fmt.Errorf("resolving path: %w", err)
@@ -389,15 +136,22 @@ func AnalyzeProjectAirgapAndEgress(targetDir string) (*CheckReport, error) {
 		return nil, fmt.Errorf("path %s must be a directory", absPath)
 	}
 
+	customRules, err := LoadCustomRules(absPath, customRulesPath)
+	if err != nil {
+		return nil, err
+	}
+
 	report := &CheckReport{
 		TargetPath: absPath,
 		Scope: CheckScope{
 			Mode:               "static",
 			InspectedManifests: []string{},
+			InspectedLockfiles: []string{},
 			InspectedEnvFiles:  []EnvFileScopeInfo{},
-			LimitationsNote:    "Static scan inspects direct manifests, source code patterns, and .env key names only. Transitive dependencies and runtime network calls are invisible without `airgap-check --run`.",
+			LimitationsNote:    "Static scan inspects structured manifest dependency sections (ignoring dev/test/lint/docs groups), lockfile BFS dependency graphs (uv.lock, poetry.lock, package-lock.json, pnpm-lock.yaml, yarn.lock, Cargo.lock), runtime source code (known downloaders + behavioral heuristics), and .env key names (values never read or logged). Runtime code paths still require `airgap-check --run`.",
 		},
 		AirgapCrashRisks:      []CheckRiskFinding{},
+		BehavioralFindings:    []CheckRiskFinding{},
 		TelemetryLeakRisks:    []CheckRiskFinding{},
 		EgressAndSecretRisks:  []CheckRiskFinding{},
 		AllowedEgressManifest: []EgressManifestEntry{},
@@ -405,9 +159,55 @@ func AnalyzeProjectAirgapAndEgress(targetDir string) (*CheckReport, error) {
 		HermeticBuildEnv:      strings.Fields(defaultHermeticRuntimeEnv),
 	}
 
-	seenRules := make(map[string]bool)
+	allPkgRules := make([]knownPackageRule, 0, len(knownAirgapAndTelemetryRules)+len(customRules.PkgRules))
+	allPkgRules = append(allPkgRules, knownAirgapAndTelemetryRules...)
+	allPkgRules = append(allPkgRules, customRules.PkgRules...)
+
+	rulesByPkg := make(map[string][]knownPackageRule)
+	for _, r := range allPkgRules {
+		for _, pkg := range r.packages {
+			n := strings.ToLower(strings.TrimSpace(pkg))
+			if n != "" {
+				rulesByPkg[n] = append(rulesByPkg[n], r)
+			}
+		}
+	}
+
+	type parsedManifestInfo struct {
+		relSlash  string
+		dirSlash  string
+		lowerName string
+		isBrowser bool
+		deps      []ManifestDep
+	}
+	type lockfileInfo struct {
+		absPath   string
+		relSlash  string
+		dirSlash  string
+		lowerName string
+		isBrowser bool
+	}
+
+	var manifests []parsedManifestInfo
+	var lockfiles []lockfileInfo
+
+	seenCodeRules := make(map[string]bool)
+	seenBehavioral := make(map[string]bool)
 	discoveredHosts := make(map[string]string)
 	seenSecrets := make(map[string]bool)
+
+	isHostIgnored := func(h string) bool {
+		return customRules.IgnoreHosts[strings.ToLower(strings.TrimSpace(h))]
+	}
+	isCompIgnored := func(comp, pkg string) bool {
+		if customRules.IgnoreComponents[strings.ToLower(strings.TrimSpace(comp))] {
+			return true
+		}
+		if pkg != "" && customRules.IgnoreComponents[strings.ToLower(strings.TrimSpace(pkg))] {
+			return true
+		}
+		return false
+	}
 
 	walkErr := filepath.Walk(absPath, func(p string, fi os.FileInfo, walkInErr error) error {
 		if walkInErr != nil {
@@ -421,94 +221,54 @@ func AnalyzeProjectAirgapAndEgress(targetDir string) (*CheckReport, error) {
 			return nil
 		}
 		name := fi.Name()
-		isEnvFile := !fi.IsDir() && strings.HasPrefix(strings.ToLower(name), ".env")
+		lowerName := strings.ToLower(name)
+		isEnvFile := !fi.IsDir() && strings.HasPrefix(lowerName, ".env")
 		if !isEnvFile && shouldSkipPath(relPath, name, fi.IsDir()) {
 			if fi.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if fi.IsDir() || !fi.Mode().IsRegular() || fi.Size() > 2*1024*1024 {
+		if fi.IsDir() || !fi.Mode().IsRegular() {
+			return nil
+		}
+
+		maxSize := int64(4 * 1024 * 1024)
+		if IsLockfileName(lowerName) {
+			maxSize = 32 * 1024 * 1024
+		}
+		if fi.Size() > maxSize {
 			return nil
 		}
 
 		relSlash := filepath.ToSlash(relPath)
-		lowerName := strings.ToLower(name)
+		dirSlash := filepath.ToSlash(filepath.Dir(relSlash))
 		isBrowserContext := isFrontendOrBrowserPath(relSlash, lowerName)
-		isNodePkgJSON := lowerName == "package.json"
 
-		if isDependencyManifest(lowerName) {
+		if IsManifestFileName(lowerName) && !IsDevOrTestManifestPath(relSlash, lowerName) {
 			report.Scope.InspectedManifests = append(report.Scope.InspectedManifests, relSlash)
 			rawBytes, err := os.ReadFile(p)
 			if err == nil {
-				manifestSearchText := strings.ToLower(string(rawBytes))
-				if isNodePkgJSON {
-					manifestSearchText = extractPackageJSONProdDependenciesText(rawBytes)
-				}
-				for _, rule := range knownAirgapAndTelemetryRules {
-					if rule.pythonOnly && isNodePkgJSON {
-						continue
-					}
-					if strings.Contains(manifestSearchText, rule.matchSubstr) {
-						execCtx := "server_runtime"
-						autoSealed := rule.autoSealed
-						mitigation := rule.mitigation
-						impact := rule.impact
-
-						if isBrowserContext && rule.category == "telemetry_analytics" {
-							execCtx = "browser_client"
-							autoSealed = false
-							impact = fmt.Sprintf("Client-side package in %s sends telemetry from the end-user's browser to %s. In air-gapped networks the server does not crash, but browser requests fail/timeout.", relSlash, strings.Join(rule.hosts, ", "))
-							mitigation = "Server environment variables do NOT disable browser SDKs; gate SDK initialization in frontend source code."
-						}
-
-						dedupKey := rule.component + "|" + execCtx
-						if seenRules[dedupKey] {
-							continue
-						}
-						seenRules[dedupKey] = true
-						seenRules[rule.component] = true
-
-						finding := CheckRiskFinding{
-							Category:         rule.category,
-							Severity:         rule.severity,
-							Component:        rule.component,
-							SourceFile:       relSlash,
-							ExecutionContext: execCtx,
-							EgressHosts:      rule.hosts,
-							FailureImpact:    impact,
-							Mitigation:       mitigation,
-							AutoSealedByEnv:  autoSealed,
-						}
-						if rule.category == "runtime_model_asset" {
-							report.AirgapCrashRisks = append(report.AirgapCrashRisks, finding)
-						} else {
-							report.TelemetryLeakRisks = append(report.TelemetryLeakRisks, finding)
-						}
-						for _, h := range rule.hosts {
-							if _, exists := discoveredHosts[h]; !exists {
-								discoveredHosts[h] = "static_manifest"
-							}
-						}
-					}
-				}
-				for sdk, host := range map[string]string{
-					"openai":              "api.openai.com",
-					"anthropic":           "api.anthropic.com",
-					"google-generativeai": "generativelanguage.googleapis.com",
-					"@google/genai":       "generativelanguage.googleapis.com",
-					"groq":                "api.groq.com",
-					"mistralai":           "api.mistral.ai",
-					"cohere":              "api.cohere.com",
-					"stripe":              "api.stripe.com",
-				} {
-					if strings.Contains(manifestSearchText, sdk) {
-						if _, exists := discoveredHosts[host]; !exists {
-							discoveredHosts[host] = "static_manifest"
-						}
-					}
-				}
+				deps, _ := ParseManifestFile(relSlash, lowerName, rawBytes)
+				manifests = append(manifests, parsedManifestInfo{
+					relSlash:  relSlash,
+					dirSlash:  dirSlash,
+					lowerName: lowerName,
+					isBrowser: isBrowserContext,
+					deps:      deps,
+				})
 			}
+		}
+
+		if IsLockfileName(lowerName) {
+			report.Scope.InspectedLockfiles = append(report.Scope.InspectedLockfiles, relSlash)
+			lockfiles = append(lockfiles, lockfileInfo{
+				absPath:   p,
+				relSlash:  relSlash,
+				dirSlash:  dirSlash,
+				lowerName: lowerName,
+				isBrowser: isBrowserContext,
+			})
 		}
 
 		if strings.HasPrefix(lowerName, ".env") && !isTemplateEnvFileName(lowerName) {
@@ -530,8 +290,10 @@ func AnalyzeProjectAirgapAndEgress(targetDir string) (*CheckReport, error) {
 							rec := classifySecretKey(keyName, relSlash, gitTracked)
 							report.SecretRecommendations = append(report.SecretRecommendations, rec)
 							for _, h := range rec.RecommendedHosts {
-								if _, exists := discoveredHosts[h]; !exists {
-									discoveredHosts[h] = "static_manifest"
+								if !isHostIgnored(h) {
+									if _, exists := discoveredHosts[h]; !exists {
+										discoveredHosts[h] = "static_manifest"
+									}
 								}
 							}
 							gitNote := "untracked local file"
@@ -564,57 +326,116 @@ func AnalyzeProjectAirgapAndEgress(targetDir string) (*CheckReport, error) {
 			rawBytes, err := os.ReadFile(p)
 			if err == nil {
 				content := string(rawBytes)
-				if strings.Contains(content, "next/font/google") && !seenRules["next/font/google"] {
-					seenRules["next/font/google"] = true
-					report.AirgapCrashRisks = append(report.AirgapCrashRisks, CheckRiskFinding{
-						Category:         "runtime_model_asset",
-						Severity:         "HIGH",
-						Component:        "next/font/google",
-						SourceFile:       relSlash,
-						ExecutionContext: "server_runtime",
-						EgressHosts:      []string{"fonts.googleapis.com", "fonts.gstatic.com"},
-						FailureImpact:    "Fetches Google Fonts over HTTPS during build; fails in offline build environments.",
-						Mitigation:       "Self-host font files with next/font/local for offline builds.",
-						AutoSealedByEnv:  false,
-					})
-				}
+				lines := strings.Split(content, "\n")
 
-				for _, codeRule := range sourceCodeDownloadRules {
-					if codeRule.re.MatchString(content) && !seenRules[codeRule.component+"|"+relSlash] {
-						seenRules[codeRule.component+"|"+relSlash] = true
-						report.AirgapCrashRisks = append(report.AirgapCrashRisks, CheckRiskFinding{
-							Category:         codeRule.category,
-							Severity:         codeRule.severity,
-							Component:        codeRule.component,
-							SourceFile:       relSlash,
-							ExecutionContext: "server_runtime",
-							EgressHosts:      codeRule.hosts,
-							FailureImpact:    codeRule.impact,
-							Mitigation:       codeRule.mitigation,
-							AutoSealedByEnv:  codeRule.autoSealed,
-						})
-						for _, h := range codeRule.hosts {
-							if _, exists := discoveredHosts[h]; !exists {
-								discoveredHosts[h] = "static_code"
-							}
+				if strings.Contains(content, "next/font/google") && !seenCodeRules["next/font/google"] && !isCompIgnored("next/font/google", "") {
+					for _, rawL := range lines {
+						if isCommentLine(strings.TrimSpace(rawL)) {
+							continue
+						}
+						if strings.Contains(rawL, "next/font/google") {
+							seenCodeRules["next/font/google"] = true
+							report.AirgapCrashRisks = append(report.AirgapCrashRisks, CheckRiskFinding{
+								Category:         "runtime_model_asset",
+								Severity:         "HIGH",
+								Component:        "next/font/google",
+								SourceFile:       relSlash,
+								DependencyScope:  "source_call",
+								ExecutionContext: "server_runtime",
+								EgressHosts:      []string{"fonts.googleapis.com", "fonts.gstatic.com"},
+								FailureImpact:    "Fetches Google Fonts over HTTPS during build; fails in offline build environments.",
+								Mitigation:       "Self-host font files with next/font/local for offline builds.",
+								AutoSealedByEnv:  false,
+							})
+							break
 						}
 					}
 				}
 
-				if !isBrowserContext {
-					matches := httpsURLRegex.FindAllStringSubmatch(content, -1)
-					for _, m := range matches {
-						if len(m) >= 2 {
-							parsed, uErr := url.Parse(m[0])
-							if uErr != nil || parsed.Hostname() == "" {
-								continue
+				var candidateCodeRules []sourceCodePatternRule
+				for _, codeRule := range sourceCodeDownloadRules {
+					if !isCompIgnored(codeRule.component, "") && hasAnySubstring(content, codeRule.hints) && codeRule.re.MatchString(content) {
+						candidateCodeRules = append(candidateCodeRules, codeRule)
+					}
+				}
+				if len(candidateCodeRules) > 0 {
+					offset := 0
+					for _, rawL := range lines {
+						lineLen := len(rawL) + 1
+						trimmed := strings.TrimSpace(rawL)
+						if trimmed != "" && !isCommentLine(trimmed) {
+							for _, codeRule := range candidateCodeRules {
+								dedupKey := codeRule.component + "|" + relSlash
+								if seenCodeRules[dedupKey] {
+									continue
+								}
+								loc := codeRule.re.FindStringIndex(rawL)
+								if loc == nil {
+									continue
+								}
+								if (strings.Contains(codeRule.component, "huggingface") || strings.Contains(codeRule.component, "TextEmbedding")) &&
+									hasLocalFilesOnlyTrueNearby(content, offset+loc[1]) {
+									continue
+								}
+								seenCodeRules[dedupKey] = true
+								report.AirgapCrashRisks = append(report.AirgapCrashRisks, CheckRiskFinding{
+									Category:         codeRule.category,
+									Severity:         codeRule.severity,
+									Component:        codeRule.component,
+									SourceFile:       relSlash,
+									DependencyScope:  "source_call",
+									ExecutionContext: "server_runtime",
+									EgressHosts:      codeRule.hosts,
+									FailureImpact:    codeRule.impact,
+									Mitigation:       codeRule.mitigation,
+									AutoSealedByEnv:  codeRule.autoSealed,
+								})
+								for _, h := range codeRule.hosts {
+									if !isHostIgnored(h) {
+										if _, exists := discoveredHosts[h]; !exists {
+											discoveredHosts[h] = "static_code"
+										}
+									}
+								}
 							}
-							h := strings.ToLower(parsed.Hostname())
-							if isIgnoredLocalOrDocHost(h) {
-								continue
-							}
-							if _, exists := discoveredHosts[h]; !exists {
-								discoveredHosts[h] = "static_code"
+						}
+						offset += lineLen
+					}
+				}
+
+				behFindings, behHosts := AnalyzeBehavioralPatterns(relSlash, content, seenBehavioral)
+				for _, bf := range behFindings {
+					if !isCompIgnored(bf.Component, "") {
+						report.BehavioralFindings = append(report.BehavioralFindings, bf)
+					}
+				}
+				for h, src := range behHosts {
+					if !isHostIgnored(h) {
+						if _, exists := discoveredHosts[h]; !exists {
+							discoveredHosts[h] = src
+						}
+					}
+				}
+
+				if !isBrowserContext && (strings.Contains(content, "http://") || strings.Contains(content, "https://")) {
+					for _, rawL := range lines {
+						trimmed := strings.TrimSpace(rawL)
+						if trimmed == "" || isCommentLine(trimmed) {
+							continue
+						}
+						for _, m := range httpsURLRegex.FindAllStringSubmatch(rawL, -1) {
+							if len(m) >= 2 {
+								parsed, uErr := url.Parse(m[0])
+								if uErr != nil || parsed.Hostname() == "" {
+									continue
+								}
+								h := strings.ToLower(parsed.Hostname())
+								if isIgnoredLocalOrDocHost(h) || isHostIgnored(h) {
+									continue
+								}
+								if _, exists := discoveredHosts[h]; !exists {
+									discoveredHosts[h] = "static_code"
+								}
 							}
 						}
 					}
@@ -627,6 +448,141 @@ func AnalyzeProjectAirgapAndEgress(targetDir string) (*CheckReport, error) {
 		return nil, walkErr
 	}
 
+	// Phase 2: Evaluate parsed manifest dependencies and lockfile BFS graphs with scope priority:
+	// prod (3) > transitive_lockfile (2) > optional_extra (1).
+	scopeRank := func(s string) int {
+		switch s {
+		case "prod":
+			return 3
+		case "transitive_lockfile":
+			return 2
+		case "optional_extra":
+			return 1
+		default:
+			return 0
+		}
+	}
+
+	crashIndexByKey := make(map[string]int)
+	telIndexByKey := make(map[string]int)
+
+	recordDep := func(dep ManifestDep, sourceLabel string, isBrowser bool) {
+		rules := rulesByPkg[dep.Name]
+		for _, rule := range rules {
+			if !matchesEcosystem(rule.ecosystems, dep.Format) {
+				continue
+			}
+			if isCompIgnored(rule.component, dep.Name) {
+				continue
+			}
+			execCtx := "server_runtime"
+			autoSealed := rule.autoSealed
+			mitigation := rule.mitigation
+			impact := rule.impact
+
+			if isBrowser && rule.category == "telemetry_analytics" {
+				execCtx = "browser_client"
+				autoSealed = false
+				impact = fmt.Sprintf("Client-side package in %s sends telemetry from the end-user's browser to %s. In air-gapped networks the server does not crash, but browser requests fail/timeout.", sourceLabel, strings.Join(rule.hosts, ", "))
+				mitigation = "Server environment variables do NOT disable browser SDKs; gate SDK initialization in frontend source code."
+			}
+
+			dedupKey := rule.component + "|" + execCtx
+			finding := CheckRiskFinding{
+				Category:         rule.category,
+				Severity:         rule.severity,
+				Component:        rule.component,
+				SourceFile:       sourceLabel,
+				DependencyScope:  dep.Scope,
+				ExecutionContext: execCtx,
+				EgressHosts:      rule.hosts,
+				FailureImpact:    impact,
+				Mitigation:       mitigation,
+				AutoSealedByEnv:  autoSealed,
+			}
+
+			if rule.category == "runtime_model_asset" {
+				if idx, exists := crashIndexByKey[dedupKey]; exists {
+					if scopeRank(dep.Scope) > scopeRank(report.AirgapCrashRisks[idx].DependencyScope) {
+						report.AirgapCrashRisks[idx].DependencyScope = dep.Scope
+						report.AirgapCrashRisks[idx].SourceFile = sourceLabel
+					}
+					continue
+				}
+				crashIndexByKey[dedupKey] = len(report.AirgapCrashRisks)
+				report.AirgapCrashRisks = append(report.AirgapCrashRisks, finding)
+			} else {
+				if idx, exists := telIndexByKey[dedupKey]; exists {
+					if scopeRank(dep.Scope) > scopeRank(report.TelemetryLeakRisks[idx].DependencyScope) {
+						report.TelemetryLeakRisks[idx].DependencyScope = dep.Scope
+						report.TelemetryLeakRisks[idx].SourceFile = sourceLabel
+					}
+					continue
+				}
+				telIndexByKey[dedupKey] = len(report.TelemetryLeakRisks)
+				report.TelemetryLeakRisks = append(report.TelemetryLeakRisks, finding)
+			}
+
+			for _, h := range rule.hosts {
+				if !isHostIgnored(h) {
+					if _, exists := discoveredHosts[h]; !exists {
+						discoveredHosts[h] = "static_manifest"
+					}
+				}
+			}
+		}
+
+		if dep.Scope == "prod" || dep.Scope == "transitive_lockfile" {
+			if host, ok := knownExternalHostSDKs[dep.Name]; ok && !isHostIgnored(host) {
+				if _, exists := discoveredHosts[host]; !exists {
+					discoveredHosts[host] = "static_manifest"
+				}
+			}
+		}
+	}
+
+	// Pass 2a: direct prod dependencies from manifests
+	allProdByDir := make(map[string][]ManifestDep)
+	var allProdGlobal []ManifestDep
+	for _, m := range manifests {
+		for _, dep := range m.deps {
+			if dep.Scope == "prod" {
+				allProdByDir[m.dirSlash] = append(allProdByDir[m.dirSlash], dep)
+				allProdGlobal = append(allProdGlobal, dep)
+				recordDep(dep, m.relSlash, m.isBrowser)
+			}
+		}
+	}
+
+	// Pass 2b: lockfile BFS graph dependencies
+	for _, lf := range lockfiles {
+		roots := allProdByDir[lf.dirSlash]
+		if len(roots) == 0 {
+			roots = allProdGlobal
+		}
+		transitive := ParseLockfileGraph(lf.absPath, lf.lowerName, roots)
+		for _, dep := range transitive {
+			src := lf.relSlash
+			if dep.Via != "" {
+				src = fmt.Sprintf("%s (via %s)", lf.relSlash, dep.Via)
+			}
+			recordDep(dep, src, lf.isBrowser)
+		}
+	}
+
+	// Pass 2c: optional_extra dependencies from manifests
+	for _, m := range manifests {
+		for _, dep := range m.deps {
+			if dep.Scope == "optional_extra" {
+				src := m.relSlash
+				if dep.Extra != "" {
+					src = fmt.Sprintf("%s [extra: %s]", m.relSlash, dep.Extra)
+				}
+				recordDep(dep, src, m.isBrowser)
+			}
+		}
+	}
+
 	rebuildAllowedEgressManifest(report, discoveredHosts)
 	report.RemediationDockerfileSnippet = generateRemediationDockerfileSnippet(report)
 	computeStaticVerdict(report)
@@ -637,29 +593,15 @@ func shouldSkipPath(relPath, name string, isDir bool) bool {
 	lower := strings.ToLower(name)
 	if isDir {
 		switch lower {
-		case ".git", "node_modules", ".next", "dist", "build", "out", "venv", ".venv", "__pycache__", "vendor", ".cache":
+		case ".git", "node_modules", ".next", "dist", "build", "out",
+			"venv", ".venv", "__pycache__", "vendor", ".cache",
+			"tests", "test", "__tests__", "testing",
+			"ci_cd", ".github", ".agents", ".claude", ".codex",
+			"fixtures", "testdata", "benchmarks", "benchmark", "examples", "docs", "cookbook":
 			return true
 		}
 	}
 	return false
-}
-
-func extractPackageJSONProdDependenciesText(rawBytes []byte) string {
-	var parsed struct {
-		Dependencies         map[string]any `json:"dependencies"`
-		OptionalDependencies map[string]any `json:"optionalDependencies"`
-	}
-	if err := json.Unmarshal(rawBytes, &parsed); err != nil {
-		return strings.ToLower(string(rawBytes))
-	}
-	var keys []string
-	for k := range parsed.Dependencies {
-		keys = append(keys, strings.ToLower(k))
-	}
-	for k := range parsed.OptionalDependencies {
-		keys = append(keys, strings.ToLower(k))
-	}
-	return strings.Join(keys, " ")
 }
 
 func isTemplateEnvFileName(lowerName string) bool {
@@ -729,7 +671,9 @@ func classifyHostDestination(host string) string {
 		return "llm_inference_api"
 	case strings.Contains(h, "posthog.com") || strings.Contains(h, "sentry.io") ||
 		strings.Contains(h, "scarf.sh") || strings.Contains(h, "telemetry.crewai.com") ||
-		strings.Contains(h, "smith.langchain.com") || strings.Contains(h, "segment.io") ||
+		strings.Contains(h, "smith.langchain.com") || strings.Contains(h, "langfuse.com") ||
+		strings.Contains(h, "wandb.ai") || strings.Contains(h, "gradio.app") ||
+		strings.Contains(h, "datadoghq.com") || strings.Contains(h, "segment.io") ||
 		strings.Contains(h, "mixpanel.com") || strings.Contains(h, "amplitude.com"):
 		return "telemetry_analytics"
 	case strings.Contains(h, "huggingface.co") || strings.Contains(h, "hf.co") ||
@@ -738,7 +682,10 @@ func classifyHostDestination(host string) string {
 		strings.Contains(h, "chroma-onnx-models.s3.amazonaws.com") ||
 		strings.Contains(h, "playwright.azureedge.net") ||
 		strings.Contains(h, "raw.githubusercontent.com") ||
-		strings.Contains(h, "download.pytorch.org"):
+		strings.Contains(h, "download.pytorch.org") ||
+		strings.Contains(h, "releases.jaided.ai") ||
+		strings.Contains(h, "modelscope.cn") ||
+		strings.Contains(h, "paddleocr.bj.bcebos.com"):
 		return "runtime_model_asset"
 	default:
 		return "external_api"
@@ -814,7 +761,7 @@ func isSelfOrCanonicalDomain(targetPath, host string) bool {
 }
 
 func computeStaticVerdict(report *CheckReport) {
-	if len(report.AirgapCrashRisks) > 0 || len(report.TelemetryLeakRisks) > 0 || len(report.EgressAndSecretRisks) > 0 {
+	if len(report.AirgapCrashRisks) > 0 || len(report.BehavioralFindings) > 0 || len(report.TelemetryLeakRisks) > 0 || len(report.EgressAndSecretRisks) > 0 {
 		report.AirgapReadinessVerdict = "ACTION_REQUIRED_STATIC_FINDINGS (run `airgap-check --run` to verify runtime behavior, or `--fix` for Dockerfile remediation)"
 		return
 	}
@@ -828,8 +775,8 @@ func mergeDynamicResultIntoReport(report *CheckReport, dyn *DynamicCheckResult) 
 	report.DynamicRun = dyn
 	report.Scope.Mode = "static+dynamic (--network none)"
 	report.Scope.LimitationsNote = fmt.Sprintf(
-		"Executed `%s` inside `docker run --rm --network none` (%s, %dms). Captures language-agnostic UDP:53 DNS queries (/etc/resolv.conf -> 127.0.0.1:53 when python3 is present), Python socket hooks, and Node.js dns/net hooks. Only code paths exercised by this command were tested; raw hardcoded-IP connections from non-Python/Node static binaries are not intercepted.",
-		dyn.Command, dyn.DockerImage, dyn.DurationMs,
+		"Executed `%s` inside `docker run --rm --network none` (%s, observer=%s, %dms). Captures UDP:53 DNS queries, loopback TLS ClientHello SNI (:443), HTTP Host/Method/Path (:80 & proxy fallback without query strings), plus Python/Node hooks. Only code paths exercised by this command were tested.",
+		dyn.Command, dyn.DockerImage, dyn.ObserverRuntime, dyn.DurationMs,
 	)
 
 	existingHosts := make(map[string]string)
@@ -842,11 +789,12 @@ func mergeDynamicResultIntoReport(report *CheckReport, dyn *DynamicCheckResult) 
 		}
 	}
 	rebuildAllowedEgressManifest(report, existingHosts)
+	report.RemediationDockerfileSnippet = generateRemediationDockerfileSnippet(report)
 
 	if dyn.CrashedInAirgap {
 		report.AirgapReadinessVerdict = fmt.Sprintf("DYNAMIC_AIRGAP_FAILURE (%s, exit=%d)", dyn.FailureCategory, dyn.ExitCode)
-	} else if len(report.AirgapCrashRisks) > 0 {
-		report.AirgapReadinessVerdict = "ACTION_REQUIRED_STATIC_FINDINGS (startup probe passed, but static runtime downloaders exist)"
+	} else if len(report.AirgapCrashRisks) > 0 || len(report.BehavioralFindings) > 0 {
+		report.AirgapReadinessVerdict = "ACTION_REQUIRED_STATIC_FINDINGS (startup probe passed, but static runtime downloaders/patterns exist)"
 	} else {
 		report.AirgapReadinessVerdict = "DYNAMIC_PROBE_PASSED_UNDER_NETWORK_NONE"
 	}
@@ -960,14 +908,6 @@ func inferHostsForWireAPIKey(upper string) []string {
 	}
 }
 
-func isDependencyManifest(lowerName string) bool {
-	switch lowerName {
-	case "requirements.txt", "pyproject.toml", "pipfile", "package.json", "go.mod", "cargo.toml", "gemfile":
-		return true
-	}
-	return strings.HasPrefix(lowerName, "requirements") && strings.HasSuffix(lowerName, ".txt")
-}
-
 func isSourceCodeFile(lowerName string) bool {
 	for _, ext := range []string{".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".rb"} {
 		if strings.HasSuffix(lowerName, ext) {
@@ -1013,169 +953,4 @@ func isIgnoredLocalOrDocHost(host string) bool {
 		}
 	}
 	return false
-}
-
-func printCheckReportHuman(out io.Writer, r *CheckReport, showFix bool) {
-	_, _ = fmt.Fprintln(out, "┌─────────────────────────────────────────────────────────────────────────────┐")
-	_, _ = fmt.Fprintln(out, "│                   AIRGAP-CHECK: OFFLINE & TELEMETRY AUDIT                   │")
-	_, _ = fmt.Fprintln(out, "└─────────────────────────────────────────────────────────────────────────────┘")
-	_, _ = fmt.Fprintf(out, "  Target Repository : %s\n", r.TargetPath)
-	_, _ = fmt.Fprintf(out, "  Test Scope        : %s (%d manifests, %d source files, %d .env files)\n",
-		r.Scope.Mode, len(r.Scope.InspectedManifests), r.Scope.ScannedSourceFiles, len(r.Scope.InspectedEnvFiles))
-	_, _ = fmt.Fprintf(out, "  Scope Note        : %s\n", r.Scope.LimitationsNote)
-	_, _ = fmt.Fprintf(out, "  Verdict           : %s\n\n", r.AirgapReadinessVerdict)
-
-	if r.DynamicRun != nil {
-		_, _ = fmt.Fprintln(out, "0. DYNAMIC AIR-GAP EXECUTION (`docker run --rm --network none`)")
-		_, _ = fmt.Fprintf(out, "   Image / Command  : %s -> `%s`\n", r.DynamicRun.DockerImage, r.DynamicRun.Command)
-		_, _ = fmt.Fprintf(out, "   Exit / Duration  : exit=%d (%dms) | crashed_in_airgap=%v\n",
-			r.DynamicRun.ExitCode, r.DynamicRun.DurationMs, r.DynamicRun.CrashedInAirgap)
-		if r.DynamicRun.FailureCategory != "" {
-			_, _ = fmt.Fprintf(out, "   Failure Category : %s\n", r.DynamicRun.FailureCategory)
-		}
-		if len(r.DynamicRun.ObservedAttempts) == 0 {
-			_, _ = fmt.Fprintln(out, "   Observed Egress  : 0 outbound DNS/TCP/TLS attempts observed.")
-		} else {
-			_, _ = fmt.Fprintf(out, "   Observed Egress  : %d outbound attempt(s) blocked by --network none:\n", len(r.DynamicRun.ObservedAttempts))
-			for _, att := range r.DynamicRun.ObservedAttempts {
-				_, _ = fmt.Fprintf(out, "     • [%s] %s:%d (%s)\n", att.Protocol, att.Host, att.Port, att.Detail)
-			}
-		}
-		if r.DynamicRun.StderrSnippet != "" {
-			_, _ = fmt.Fprintf(out, "   Stderr Excerpt   :\n     %s\n", strings.ReplaceAll(r.DynamicRun.StderrSnippet, "\n", "\n     "))
-		}
-		_, _ = fmt.Fprintln(out)
-	}
-
-	_, _ = fmt.Fprintf(out, "1. AIR-GAP RUNTIME CRASH RISKS (%d found)\n", len(r.AirgapCrashRisks))
-	if len(r.AirgapCrashRisks) == 0 {
-		_, _ = fmt.Fprintln(out, "   • No known runtime downloader packages or calls found in static scan.")
-	} else {
-		for _, f := range r.AirgapCrashRisks {
-			_, _ = fmt.Fprintf(out, "   • [%s | BUILD-TIME BAKE REQUIRED] %s (%s)\n", f.Severity, f.Component, f.SourceFile)
-			_, _ = fmt.Fprintf(out, "     Egress   : %s\n", strings.Join(f.EgressHosts, ", "))
-			_, _ = fmt.Fprintf(out, "     Impact   : %s\n", f.FailureImpact)
-			_, _ = fmt.Fprintf(out, "     Action   : %s\n", f.Mitigation)
-		}
-	}
-	_, _ = fmt.Fprintln(out)
-
-	_, _ = fmt.Fprintf(out, "2. TELEMETRY & EXTERNAL ANALYTICS (%d found)\n", len(r.TelemetryLeakRisks))
-	if len(r.TelemetryLeakRisks) == 0 {
-		_, _ = fmt.Fprintln(out, "   • None detected in static scan.")
-	} else {
-		for _, f := range r.TelemetryLeakRisks {
-			badge := "SERVER RUNTIME — REVIEW REQUIRED"
-			if f.ExecutionContext == "browser_client" {
-				badge = "BROWSER CLIENT — SERVER ENV DOES NOT SILENCE"
-			} else if f.AutoSealedByEnv {
-				badge = "SERVER RUNTIME — SILENCE VIA ENV (--fix)"
-			}
-			_, _ = fmt.Fprintf(out, "   • [%s | %s] %s (%s)\n", f.Severity, badge, f.Component, f.SourceFile)
-			_, _ = fmt.Fprintf(out, "     Egress   : %s\n", strings.Join(f.EgressHosts, ", "))
-			_, _ = fmt.Fprintf(out, "     Behavior : %s\n", f.FailureImpact)
-			_, _ = fmt.Fprintf(out, "     Action   : %s\n", f.Mitigation)
-		}
-	}
-	_, _ = fmt.Fprintln(out)
-
-	_, _ = fmt.Fprintf(out, "3. .ENV CREDENTIALS & USAGE CLASSIFICATION (%d found — values never read/logged)\n", len(r.SecretRecommendations))
-	if len(r.SecretRecommendations) == 0 {
-		_, _ = fmt.Fprintln(out, "   • No credentials detected in .env files.")
-	} else {
-		for _, rec := range r.SecretRecommendations {
-			gitStatus := "untracked (.gitignore)"
-			if rec.GitTracked {
-				gitStatus = "WARNING: TRACKED IN GIT"
-			}
-			_, _ = fmt.Fprintf(out, "   • %s [%s | %s]\n", rec.SecretKey, rec.UsageKind, gitStatus)
-			_, _ = fmt.Fprintf(out, "     Analysis : %s\n", rec.Explanation)
-			_, _ = fmt.Fprintf(out, "     Guidance : %s\n", rec.Guidance)
-		}
-	}
-	_, _ = fmt.Fprintln(out)
-
-	_, _ = fmt.Fprintf(out, "4. OBSERVED & REFERENCED EXTERNAL HOSTS (%d hosts)\n", len(r.AllowedEgressManifest))
-	if len(r.AllowedEgressManifest) == 0 {
-		_, _ = fmt.Fprintln(out, "   • None detected.")
-	} else {
-		_, _ = fmt.Fprintf(out, "   %-36s %-22s %-24s %-30s\n", "HOST", "SOURCE", "CLASSIFICATION", "HANDLING")
-		for _, m := range r.AllowedEgressManifest {
-			_, _ = fmt.Fprintf(out, "   %-36s %-22s %-24s %-30s\n", m.Host, m.Source, m.Classification, m.PolicyAction)
-		}
-	}
-	_, _ = fmt.Fprintln(out)
-	_, _ = fmt.Fprintf(out, "5. RECOMMENDED OFFLINE ENV FLAGS (pass `--fix` for a ready-to-paste Dockerfile block)\n   %s\n", strings.Join(r.HermeticBuildEnv, " "))
-	if showFix && r.RemediationDockerfileSnippet != "" {
-		_, _ = fmt.Fprintln(out)
-		_, _ = fmt.Fprintln(out, "6. STANDALONE DOCKERFILE REMEDIATION (`--fix` — paste into your Dockerfile)")
-		for _, line := range strings.Split(r.RemediationDockerfileSnippet, "\n") {
-			_, _ = fmt.Fprintf(out, "   %s\n", line)
-		}
-	}
-}
-
-func generateRemediationDockerfileSnippet(r *CheckReport) string {
-	var b strings.Builder
-	b.WriteString("# --- BEGIN AIR-GAP & TELEMETRY REMEDIATION (paste into your Dockerfile) ---\n")
-	b.WriteString("# 1. Silence background SDK telemetry & enforce writable offline cache paths\n")
-	b.WriteString("ENV DO_NOT_TRACK=1 \\\n")
-	b.WriteString("    NEXT_TELEMETRY_DISABLED=1 \\\n")
-	b.WriteString("    ANONYMIZED_TELEMETRY=False \\\n")
-	b.WriteString("    CHROMA_TELEMETRY_IMPL=none \\\n")
-	b.WriteString("    SCARF_NO_ANALYTICS=true \\\n")
-	b.WriteString("    HF_HUB_DISABLE_TELEMETRY=1 \\\n")
-	b.WriteString("    HF_HUB_OFFLINE=1 \\\n")
-	b.WriteString("    TRANSFORMERS_OFFLINE=1 \\\n")
-	b.WriteString("    LANGCHAIN_TRACING_V2=false \\\n")
-	b.WriteString("    CREWAI_DISABLE_TELEMETRY=true \\\n")
-	b.WriteString("    OTEL_SDK_DISABLED=true \\\n")
-	b.WriteString("    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \\\n")
-	b.WriteString("    XDG_CACHE_HOME=/app/.cache \\\n")
-	b.WriteString("    TIKTOKEN_CACHE_DIR=/app/.cache/tiktoken \\\n")
-	b.WriteString("    HF_HOME=/app/.cache/huggingface \\\n")
-	b.WriteString("    NLTK_DATA=/app/.cache/nltk_data \\\n")
-	b.WriteString("    PLAYWRIGHT_BROWSERS_PATH=/app/.cache/ms-playwright\n")
-	b.WriteString("RUN mkdir -p /app/.cache/tiktoken /app/.cache/huggingface /app/.cache/nltk_data /app/.cache/ms-playwright\n")
-
-	seenComp := make(map[string]bool)
-	for _, f := range r.AirgapCrashRisks {
-		comp := strings.ToLower(f.Component)
-		switch {
-		case strings.Contains(comp, "tiktoken") && !seenComp["tiktoken"]:
-			seenComp["tiktoken"] = true
-			b.WriteString("\n# Pre-warm Python tiktoken BPE encodings (cl100k_base & o200k_base) at build time\n")
-			b.WriteString("RUN TIKTOKEN_CACHE_DIR=/app/.cache/tiktoken python3 -c \"import tiktoken; [tiktoken.get_encoding(e) for e in ('cl100k_base', 'o200k_base')]\"\n")
-		case strings.Contains(comp, "chromadb") && !seenComp["chromadb"]:
-			seenComp["chromadb"] = true
-			b.WriteString("\n# Pre-warm ChromaDB default ONNX embedding model (all-MiniLM-L6-v2) at build time\n")
-			b.WriteString("RUN HOME=/app XDG_CACHE_HOME=/app/.cache python3 -c \"from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2; ef = ONNXMiniLM_L6_V2(); ef(['airgap-warmup'])\"\n")
-		case strings.Contains(comp, "fastembed") && !seenComp["fastembed"]:
-			seenComp["fastembed"] = true
-			b.WriteString("\n# Pre-warm FastEmbed default ONNX model into /app/.cache/fastembed at build time\n")
-			b.WriteString("RUN python3 -c \"from fastembed import TextEmbedding; list(TextEmbedding(cache_dir='/app/.cache/fastembed').embed(['airgap-warmup']))\"\n")
-		case (strings.Contains(comp, "transformers") || strings.Contains(comp, "huggingface")) && !seenComp["hf"]:
-			seenComp["hf"] = true
-			b.WriteString("\n# Pre-download HuggingFace model weights during build (replace <MODEL_ID> with your model)\n")
-			b.WriteString("# RUN HF_HOME=/app/.cache/huggingface HF_HUB_OFFLINE=0 python3 -c \"from huggingface_hub import snapshot_download; snapshot_download('<MODEL_ID>')\"\n")
-		case strings.Contains(comp, "nltk") && !seenComp["nltk"]:
-			seenComp["nltk"] = true
-			b.WriteString("\n# Pre-download NLTK corpora into /app/.cache/nltk_data during build\n")
-			b.WriteString("RUN python3 -m nltk.downloader -d /app/.cache/nltk_data punkt punkt_tab stopwords averaged_perceptron_tagger\n")
-		case strings.Contains(comp, "spacy") && !seenComp["spacy"]:
-			seenComp["spacy"] = true
-			b.WriteString("\n# Pre-install spaCy pipeline wheel during build\n")
-			b.WriteString("RUN python3 -m spacy download en_core_web_sm\n")
-		case strings.Contains(comp, "whisper") && !seenComp["whisper"]:
-			seenComp["whisper"] = true
-			b.WriteString("\n# Pre-warm OpenAI Whisper checkpoint into /app/.cache/whisper during build\n")
-			b.WriteString("RUN XDG_CACHE_HOME=/app/.cache python3 -c \"import whisper; whisper.load_model('base')\"\n")
-		case strings.Contains(comp, "playwright") && !seenComp["playwright"]:
-			seenComp["playwright"] = true
-			b.WriteString("\n# Pre-install Playwright Chromium headless browser binary during build\n")
-			b.WriteString("RUN PLAYWRIGHT_BROWSERS_PATH=/app/.cache/ms-playwright npx playwright install --with-deps chromium\n")
-		}
-	}
-	b.WriteString("# --- END AIR-GAP & TELEMETRY REMEDIATION ---")
-	return b.String()
 }

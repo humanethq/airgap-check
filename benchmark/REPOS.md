@@ -40,3 +40,36 @@ Rules were frozen prior to evaluating these repositories. These are probe-based 
 | `litellm` | `https://github.com/BerriAI/litellm.git` | `2f430873aead937b9112e683703956eb1ab179af` | `python3 -c "import urllib.request; urllib.request.urlopen('https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json', timeout=3)"` | exit 1 (234 ms) | `raw.githubusercontent.com` |
 | `pydantic-ai` | `https://github.com/pydantic/pydantic-ai.git` | `c9c896e9f097362c69cabf5312d345155aec9625` | `python3 -c "import tiktoken; tiktoken.encoding_for_model('gpt-4o')"` | exit 1 (357 ms) | `openaipublic.blob.core.windows.net` |
 | `chat-langchain` | `https://github.com/langchain-ai/chat-langchain.git` | `1a5fbe967b47bdc5d5f142c515fd8bc0b185bd81` | `python3 -c "print('chat-langchain-offline-probe')"` | exit 0 (137 ms) | None (clean of runtime downloads) |
+
+---
+
+## v0.2.0 Static + Transitive Lockfile + Behavioral Verification (November 10, 2026)
+
+Re-running `airgap-check --json` (`v0.2.0`) on the exact same pinned commits above measures structural manifest parsing, BFS lockfile resolution (`uv.lock`, `poetry.lock`, `package-lock.json`, `pnpm-lock.yaml`, `Cargo.lock`), and universal behavioral heuristics across all 20 repositories:
+
+### Held-Out Set (10 Repositories, v0.2.0)
+
+| Repository | Scan Time | Source Files | Manifests / Lockfiles | Runtime Crash Findings (`prod` / `transitive_lockfile` / `source_call`) | Optional Extras (`optional_extra`) | Behavioral Findings (beyond rule table) | Telemetry Findings |
+| :--- | :-: | :-: | :-: | :--- | :--- | :--- | :--- |
+| `gpt-engineer` | 0.01 s | 41 | 2 / 1 | `tiktoken` (`prod`, `source_call`), `huggingface-hub` (`transitive_lockfile` via `datasets`) | — | — | `langsmith` (`transitive_lockfile`) |
+| `gpt-researcher` | 0.09 s | 294 | 11 / 0 | `tiktoken`, `nltk`, `litellm`, `huggingface-hub`, `ml-weight-downloader`, `next/font/google` | `playwright` (`[extra: requirements-txt]`) | `pip install` subprocess (`llm_provider/generic/base.py:415`) | `langsmith` (`prod`) |
+| `llama_index` | 1.65 s | 2,133 | 715 / 602 | `tiktoken`, `nltk`, `fastembed`, `sentence-transformers`, `huggingface-hub`, `litellm`, `transformers`, `FlagEmbedding`, `chromadb`, `ml-weight-downloader`, `paddleocr`, `playwright`, `whisper`, `spacy` (`transitive_lockfile`), `rapidocr` (`transitive_lockfile`) | — | `huggingface.co` GGUF URL (`llama_cpp/base.py:78`), `~/.cache` write (`legacy_office/reader.py`), HTTP calls missing `timeout=` | `langfuse`, `wandb`, `chromadb`, `langsmith`, `sentry-sdk`, `opentelemetry-exporter-otlp`, `gradio`, `posthog` |
+| `mem0` | 0.35 s | 589 | 18 / 11 | `fastembed`, `huggingface_hub`, `transformers` (`mem0-ts/pnpm-lock.yaml`) | `spacy`, `chromadb`, `litellm`, `sentence-transformers`, `fastembed` | `ollama pull` subprocess (`_setup.py:386`), HTTP call missing `timeout=` (`client/main.py:1359`) | `posthog` (`prod`), `langsmith` (`transitive_lockfile`), `chromadb` (`optional_extra`) |
+| `vanna` | 0.13 s | 290 | 2 / 0 | `fastembed`, `huggingface_hub` (`source_call`) | `chromadb`, `fastembed`, `transformers` (`[extra: all]`) | 5 files with HTTP calls missing `timeout=` | `chromadb` (`[extra: all]`) |
+| `quivr` | 0.31 s | 755 | 36 / 2 | `huggingface-hub`, `sentence-transformers`, `transformers` | — | — | — |
+| `docling` | 0.21 s | 338 | 3 / 1 | `huggingface-hub`, `whisper`, `easyocr.Reader()`, `RapidOCR()`, `ml-weight-downloader`, `rapidocr` (`transitive_lockfile`), `transformers` (`transitive_lockfile`) | `playwright`, `whisper`, `easyocr` | — | — |
+| `litellm` | 3.40 s | 5,732 | 85 / 5 | `tiktoken` (`Cargo.toml` + `pyproject.toml` + `source_call`), `huggingface-hub`, `next/font/google` | — | `raw.githubusercontent.com` cost map (`litellm/__init__.py:411`, `policy.rs:20`), `pip install` (`supabase.py:24`, `litellm_logging.py:5591`) | `langfuse`, `opentelemetry-exporter-otlp`, `ddtrace`, `sentry-sdk` (`[extra: proxy-runtime]`) |
+| `pydantic-ai` | 0.98 s | 1,130 | 8 / 2 | `tiktoken` (`uv.lock` via `pydantic-ai-slim[openai]`) | `huggingface-hub`, `sentence-transformers`, `playwright` (`pydantic_ai_harness`) | — | `opentelemetry-exporter-otlp` (`uv.lock`) |
+| `chat-langchain` | 0.03 s | 92 | 2 / 1 | — (0 runtime downloads) | — | — | `langsmith` (`browser_client` + `server_runtime`) |
+
+Notes comparing v0.1.0 (`8ce2f11`) and v0.2.0 on the held-out set:
+- All 4 v0.1.0 false positives caused by unscoped `[dependency-groups]` / TOML key-name text matching (`docling`, `litellm`, `pydantic-ai`) are eliminated.
+- All 5 v0.1.0 false negatives (`FlagEmbedding`, `paddleocr`, `easyocr`, `rapidocr`, and `litellm`'s startup cost-map fetch) are detected (`litellm`'s cost map URL is caught generically by the behavioral URL analyzer without requiring a package rule).
+- Calibration set (`10` repos) scan times in v0.2.0 ranged from `0.00 s` (`llm-examples`) to `0.16 s` (`chat-ui`, `firecrawl-app-examples`).
+
+### Dynamic Observer E2E Checks (`docker run --rm --network none`)
+
+In addition to the probe tests above, `go test -v ./...` verifies unknown-host capture directly via container loopback sinkholes (no dependency on package rules):
+- `TestStandaloneDynamicUnderNetworkNone`: Python subprocess `/usr/bin/getent` DNS lookup + plain HTTP (`?token=` stripped) + HTTPS TLS ClientHello SNI captured inside `python:3.12-slim-bookworm`.
+- `TestNodeOnlyDynamicUnderNetworkNone`: Pure Node.js HTTP + HTTPS `ClientHello` SNI capture inside `node:20-bookworm-slim` (`observer=node+udp53+sni`).
+- `TestDynamicNxdomainAndDockerfileBuild`: `--build` temporary Dockerfile image build + `--network none` SNI capture, plus `--dns-action nxdomain` immediate `DNS_RESOLUTION_BLOCKED_IN_AIRGAP` verification.

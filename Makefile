@@ -1,7 +1,7 @@
 .PHONY: build test install clean
 
 build:
-	go build -o bin/airgap-check ./cmd/airgap-check
+	go build -trimpath -o bin/airgap-check ./cmd/airgap-check
 
 test:
 	go test -v ./...

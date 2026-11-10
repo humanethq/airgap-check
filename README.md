@@ -12,9 +12,11 @@ None of this is a bug in those libraries. They download once and cache. It only 
 
 ## What it does
 
-- **Static scan.** Reads manifests (`requirements.txt`, `pyproject.toml`, `package.json`, `Cargo.toml`), looks for code patterns (`nltk.download()`, `from_pretrained()`, `tiktoken.get_encoding()`, `whisper.load_model()`, `next/font/google`) and classifies `.env` keys. It reads key names only; secret values are never read or logged.
-- **`--run`.** Runs your app in `docker run --rm --network none` with a DNS sinkhole and socket hooks, and logs every lookup and connection attempt.
-- **`--fix`.** Prints Dockerfile lines (offline `ENV` flags and build-time pre-warming commands) that you can adapt for your own image.
+- **Structural manifest & lockfile graph scan.** Structurally parses `requirements*.txt`, `pyproject.toml` (ignoring `[dependency-groups]`, `dev`/`test`/`lint`/`docs` groups, and extra key names), `Pipfile`, `package.json` (skipping `devDependencies`), `Cargo.toml`, `go.mod`, and `Gemfile`. Walks `uv.lock`, `poetry.lock`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, and `Cargo.lock` via BFS from production roots so transitive weight/telemetry dependencies are found with explicit scope tags (`prod`, `transitive_lockfile`, `optional_extra`).
+- **Known + universal behavioral source analysis.** Detects known runtime fetch calls (`nltk.download()`, `from_pretrained()`, `tiktoken.get_encoding()`, `whisper.load_model()`, `easyocr.Reader()`, `RapidOCR()`, `PaddleOCR()`, `FlagModel`/`FlagReranker`, `TextEmbedding()`, `next/font/google`) while respecting comments and `local_files_only=True`. Also flags unknown-library patterns generically: remote weight/archive/cost-map URLs (`.onnx`, `.safetensors`, `.gguf`, `.pth`, `model_prices_and_context_window.json`), `urlretrieve()`, runtime `subprocess`/`pip install`/`ollama pull`, Python `requests`/`urllib` calls omitting `timeout=`, and hardcoded `~/.cache` writes.
+- **Multi-runtime `--run`.** Runs your app or probe inside `docker run --rm --network none` with an isolated loopback sinkhole (`UDP:53` DNS, `TCP:443` TLS `ClientHello` SNI, `TCP:80` HTTP Host/Path with query strings stripped, plus `HTTP_PROXY` fallback) and Python/Node socket hooks — supporting both Python (`runner.py`) and pure Node.js (`runner.js`) containers without package rules.
+- **`--fix` & `.airgap-check.json`.** Prints Dockerfile lines (offline `ENV` flags and build-time pre-warming commands) tailored to detected ecosystems, and lets repositories extend or suppress rules via `.airgap-check.json` or `--rules`.
+- **`.env` key classification.** Inspects `.env*` key names and `git ls-files` status only; secret values are never read or logged.
 
 Go standard library only. `--run` requires Docker.
 
@@ -44,11 +46,15 @@ airgap-check --fix /path/to/repo
 # run in a container with no network
 airgap-check --run /path/to/repo
 
-# use your own image and a smoke test that exercises your code paths
-airgap-check --run --image my-app:latest --run-cmd "python3 -m pytest tests/smoke_test.py" /path/to/repo
+# auto-build the repo's Dockerfile first, then run inside --network none
+airgap-check --run --build --run-cmd "python3 -m pytest tests/smoke_test.py" /path/to/repo
 
-# machine-readable output
-airgap-check --json /path/to/repo
+# use your own image, NXDOMAIN DNS mode, or a custom rules file
+airgap-check --run --dns-action nxdomain --image my-app:latest --run-cmd "node server.js" /path/to/repo
+airgap-check --rules ./airgap.custom.json /path/to/repo
+
+# machine-readable output (flags may appear before or after the path)
+airgap-check /path/to/repo --json
 ```
 
 ### Example `--fix` output (abridged)
@@ -66,15 +72,24 @@ ENV DO_NOT_TRACK=1 \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     LANGCHAIN_TRACING_V2=false \
+    LANGFUSE_ENABLED=false \
     CREWAI_DISABLE_TELEMETRY=true \
     OTEL_SDK_DISABLED=true \
+    DD_TRACE_ENABLED=false \
+    WANDB_MODE=offline \
+    WANDB_DISABLED=true \
+    GRADIO_ANALYTICS_ENABLED=False \
+    LITELLM_LOCAL_MODEL_COST_MAP=True \
     STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
     XDG_CACHE_HOME=/app/.cache \
     TIKTOKEN_CACHE_DIR=/app/.cache/tiktoken \
     HF_HOME=/app/.cache/huggingface \
     NLTK_DATA=/app/.cache/nltk_data \
-    PLAYWRIGHT_BROWSERS_PATH=/app/.cache/ms-playwright
-RUN mkdir -p /app/.cache/tiktoken /app/.cache/huggingface /app/.cache/nltk_data /app/.cache/ms-playwright
+    EASYOCR_MODULE_PATH=/app/.cache/easyocr \
+    TORCH_HOME=/app/.cache/torch \
+    PLAYWRIGHT_BROWSERS_PATH=/app/.cache/ms-playwright \
+    PUPPETEER_CACHE_DIR=/app/.cache/puppeteer
+RUN mkdir -p /app/.cache/tiktoken /app/.cache/huggingface /app/.cache/nltk_data /app/.cache/easyocr /app/.cache/torch /app/.cache/ms-playwright /app/.cache/puppeteer
 
 # Pre-warm Python tiktoken encodings at build time
 RUN TIKTOKEN_CACHE_DIR=/app/.cache/tiktoken python3 -c "import tiktoken; [tiktoken.get_encoding(e) for e in ('cl100k_base', 'o200k_base')]"
@@ -86,17 +101,19 @@ RUN HOME=/app XDG_CACHE_HOME=/app/.cache python3 -c "from chromadb.utils.embeddi
 
 ## How `--run` works, and where it stops
 
-`--run` starts a container with `--network none`, mounts your repository read-only, and mounts a small observer:
+`--run` starts a container with `--network none`, mounts your repository read-only, and injects an isolated loopback observer (`runner.py` in Python containers, or `runner.js` in Node-only containers; pass `--build` to build the repo's `Dockerfile` first):
 
-- A DNS sinkhole on `127.0.0.1:53/udp`. `/etc/resolv.conf` points to it, so lookups that go through the container's resolver are recorded and answered with `NXDOMAIN`.
-- Python (`sitecustomize.py`) and Node (`node_preload.js`) hooks that record socket-level attempts.
+- **Loopback DNS sinkhole (`127.0.0.1:53/udp`)** with `/etc/resolv.conf` updated inside the ephemeral container. In the default `sinkhole` mode (`--dns-action sinkhole`), `A` queries resolve to `127.0.0.1` so outbound connections continue to our loopback TLS/HTTP listeners rather than dying at DNS before showing their HTTP path or SNI hostname. Pass `--dns-action nxdomain` to fail immediately at DNS resolution.
+- **TLS `ClientHello` SNI (`127.0.0.1:443`) & HTTP (`127.0.0.1:80`) sinkholes**, plus an `HTTP_PROXY`/`HTTPS_PROXY` loopback `CONNECT` fallback when running as a non-root container user without bind privileges on ports `< 1024`. Query strings are stripped from captured URLs.
+- **Python (`sitecustomize.py`) & Node (`node_preload.js`) socket hooks** recording `socket.getaddrinfo`, `socket.connect`, `dns.lookup`, and `net.Socket.connect`.
 
 Limits:
 
-- We validated `--run` on Python and Node targets. Other runtimes should be caught if they use the system resolver, but we have not verified that.
-- Traffic to hardcoded IP addresses, or DNS-over-HTTPS, skips the resolver and is not caught.
+- Loopback sinkholes (`runner.py` and `runner.js`) were validated in real `docker run --network none` containers for both Python (`python:3.12-slim-bookworm`) and pure Node.js (`node:20-bookworm-slim`). Other runtimes without Python or Node fall back to `shell_only` error URL extraction and are not separately validated.
+- Traffic to hardcoded external IP addresses (not hostnames) fails with `ENETUNREACH` in the kernel without hitting loopback SNI/HTTP listeners, though `sitecustomize.py`/`node_preload.js` capture literal connect targets in Python/Node. DNS-over-HTTPS traffic skips the system resolver unless SNI reveals the DoH provider.
+- Non-root containers running compiled Go/Rust binaries that ignore `HTTP_PROXY` and cannot bind ports 53/80/443 inside the unprivileged user namespace will log `ENETUNREACH` rather than SNI unless run as root inside the throwaway test container.
 - Only the code paths you exercise are tested. Use `--run-cmd` to run a smoke test that covers the paths you care about.
-- The sinkhole refuses immediately. In a real enclave, packets may be dropped instead, so hangs can be longer than the times below.
+- The sinkhole answers immediately. In a real enclave, packets may be dropped instead, so hangs can be longer than the times below.
 
 ## Benchmark
 
@@ -138,27 +155,63 @@ These are probe-based tests: we did not start the applications themselves. A “
 
 At component level: 35 true positives, 4 false positives, 5 false negatives. That is 89.7% precision and 87.5% recall. This is a small sample, so treat the numbers as rough. At repository level, all 9 repositories with first-use downloads were flagged, and `chat-langchain` was correctly flagged as clean.
 
-False positives (all 4): `pyproject.toml` is scanned as text, so dev and test dependency groups (`playwright` in `docling`, `litellm`, `pydantic-ai`) and an optional extra named `posthog` triggered warnings. `package.json` is parsed, so its `devDependencies` are skipped.
+False positives (all 4 in v0.1.0): `pyproject.toml` was scanned as plain text, so dev and test dependency groups (`playwright` in `docling`, `litellm`, `pydantic-ai`) and an optional extra named `posthog` triggered warnings.
 
-False negatives (all 5): OCR weight downloaders (`easyocr`, `rapidocr`, `paddleocr`), `FlagEmbedding`, and LiteLLM's startup fetch of `model_prices_and_context_window.json` were not in the frozen rule table. `--run` is meant to catch this kind of miss, but only on the paths it exercises.
+False negatives (all 5 in v0.1.0): OCR weight downloaders (`easyocr`, `rapidocr`, `paddleocr`), `FlagEmbedding`, and LiteLLM's startup fetch of `model_prices_and_context_window.json` were not in the frozen rule table.
+
+### What changed in v0.2.0 (re-run on the same pinned commits)
+
+Re-running `v0.2.0` on the exact same 10 held-out commits:
+
+- Eliminates all 4 v0.1.0 dev-group / key-name false positives (`0` dev/lint/key-name false positives; optional extras such as `format-html-render` in `docling` or `[extra: playwright]` in `pydantic_ai_harness` are tagged explicitly as `optional_extra` rather than `prod`).
+- Closes all 5 v0.1.0 false negatives (`FlagEmbedding`, `paddleocr`, `easyocr`, `rapidocr`, and `litellm`'s startup `model_prices_and_context_window.json` fetch — the latter caught generically by the behavioral URL scanner without requiring a package rule).
+- Surfaces transitive air-gap dependencies via lockfile BFS (`huggingface-hub` via `datasets` in `gpt-engineer`'s `poetry.lock`, `spacy` and `rapidocr` via `uv.lock` in `llama_index`, `@huggingface/transformers` via `pnpm-lock.yaml` in `mem0`, `tiktoken` via `uv.lock` in `pydantic-ai`) and runtime `pip install` / `ollama pull` subprocess calls (`gpt-researcher`, `litellm`, `mem0`).
+
+Per-repository v0.2.0 scan timings and detailed breakdowns (0.01 s – 3.40 s across the 10 held-out repos, including 715 manifests / 602 lockfiles in `llama_index` in 1.65 s and 5,732 source files in `litellm` in 3.40 s) are recorded in [`benchmark/REPOS.md`](benchmark/REPOS.md).
 
 ## Supported checks
 
 | Category | Pattern | Host(s) | `--fix` |
 | :--- | :--- | :--- | :--- |
-| Runtime download | `tiktoken` (Python) | `openaipublic.blob.core.windows.net` | pre-warms `cl100k_base`, `o200k_base` |
+| Runtime download | `tiktoken` (Python & `tiktoken-rs`) | `openaipublic.blob.core.windows.net` | pre-warms `cl100k_base`, `o200k_base` |
 | Runtime download | `chromadb` default embedder | `chroma-onnx-models.s3.amazonaws.com` | pre-warms `ONNXMiniLM_L6_V2` |
-| Runtime download | `fastembed` | `huggingface.co`, `cdn-lfs.hf.co` | pre-warms the model cache |
-| Runtime download | `sentence-transformers`, `transformers`, `from_pretrained()` | `huggingface.co`, `cdn-lfs.hf.co` | sets offline `ENV` flags; prints model snapshot template |
-| Runtime download | `whisper.load_model()` | `openaipublic.azureedge.net` | pre-warms the checkpoint |
-| Runtime download | `playwright` | `playwright.azureedge.net` | installs the browser into `PLAYWRIGHT_BROWSERS_PATH` |
-| Runtime download | `nltk.download()` | `raw.githubusercontent.com` | pre-downloads corpora into `NLTK_DATA` |
-| Runtime download | `spacy.cli.download()` | `raw.githubusercontent.com` | installs the model wheel at build time |
-| Runtime download | `torch.hub.load()` | `github.com`, `download.pytorch.org` | flagged only; pre-populate `TORCH_HOME` manually |
+| Runtime download | `fastembed`, `TextEmbedding()` | `huggingface.co`, `cdn-lfs.hf.co` | pre-warms the model cache |
+| Runtime download | `sentence-transformers`, `transformers`, `@huggingface/transformers`, `from_pretrained()`, `hf_hub_download()`, `snapshot_download()` | `huggingface.co`, `cdn-lfs.hf.co` | sets offline `ENV` flags; prints model snapshot template (skips if `local_files_only=True`) |
+| Runtime download | `FlagEmbedding` (`FlagModel`, `FlagReranker`, `BGEM3FlagModel`) | `huggingface.co`, `cdn-lfs.hf.co` | sets offline `ENV` flags; prints snapshot template |
+| Runtime download | `easyocr`, `rapidocr*`, `paddleocr` | `github.com`, `releases.jaided.ai`, `huggingface.co`, `modelscope.cn`, `paddleocr.bj.bcebos.com` | pre-warms OCR weights / `EASYOCR_MODULE_PATH` |
+| Runtime download | `whisper.load_model()` / `faster-whisper` / `mlx-whisper` | `openaipublic.azureedge.net`, `huggingface.co` | pre-warms the checkpoint |
+| Runtime download | `litellm` startup cost map | `raw.githubusercontent.com` | sets `LITELLM_LOCAL_MODEL_COST_MAP=True` |
+| Runtime download | `playwright`, `puppeteer` | `playwright.azureedge.net`, `storage.googleapis.com` | installs Chromium (`python3 -m playwright` / `npx playwright` / `npx puppeteer`) |
+| Runtime download | `nltk.download()`, `spacy.cli.download()` | `raw.githubusercontent.com` | pre-downloads corpora / model wheel at build time |
+| Runtime download | `torch.hub.load()`, `timm`, `ultralytics`, `unstructured`, `surya-ocr`, `docling-ibm-models`, `kokoro` | `github.com`, `download.pytorch.org`, `huggingface.co` | flagged + `TORCH_HOME` / `HF_HOME` setup |
 | Build-time download | `next/font/google` | `fonts.googleapis.com`, `fonts.gstatic.com` | flagged only; suggests `next/font/local` |
-| Server telemetry | `chromadb`, `crewai`, `langsmith`, `scarf` | PostHog, `telemetry.crewai.com`, `api.smith.langchain.com`, `scarf.sh` | sets the matching disable flags |
-| Browser telemetry | `posthog-js`, `@sentry/*` in frontend code | PostHog, Sentry | flagged only; disable the SDK in your frontend code |
+| Behavioral heuristics | Remote `.onnx`/`.safetensors`/`.gguf`/cost-map URLs, `urlretrieve()`, archive fetch+unpack, runtime `subprocess` (`pip install`, `curl`, `wget`, `ollama pull`), Python HTTP calls omitting `timeout=`, hardcoded `~/.cache` writes | dynamic / inferred hosts | hints detected hosts & explicit `timeout=(2, 10)` action |
+| Server telemetry | `chromadb`, `crewai`, `langsmith`, `langfuse`, `wandb`, `opentelemetry-exporter-otlp`, `ddtrace`, `gradio`, `scarf` | PostHog, `telemetry.crewai.com`, `api.smith.langchain.com`, `cloud.langfuse.com`, `api.wandb.ai`, Datadog, `api.gradio.app`, `scarf.sh` | sets the matching disable flags |
+| Browser telemetry | `posthog-js`, `@sentry/*`, frontend `langsmith` | PostHog, Sentry, LangSmith | flagged only; disable the SDK in your frontend code |
 | `.env` keys | `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `STRIPE_*`, `JWT_*`, `CLOUDINARY_*`, `AWS_SECRET*` and others | n/a | flagged only; classifies key names and git tracking status |
+
+### Custom rules (`.airgap-check.json` / `--rules`)
+
+Drop `.airgap-check.json` in your repository root (or pass `--rules path/to/rules.json`) to add internal packages or suppress known-good components/hosts:
+
+```json
+{
+  "rules": [
+    {
+      "package_or_pattern": "internal-embedder",
+      "component": "internal-embedder-sdk",
+      "category": "runtime_model_asset",
+      "severity": "CRITICAL",
+      "hosts": ["models.internal.corp"],
+      "impact": "Fetches internal weights at boot.",
+      "mitigation": "Bake weights into /app/models during build.",
+      "python_only": true
+    }
+  ],
+  "ignore_components": ["gradio"],
+  "ignore_hosts": ["api.gradio.app"]
+}
+```
 
 ## Design principles
 
