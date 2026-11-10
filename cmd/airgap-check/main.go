@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-var version = "v0.2.0-dev"
+var version = "v0.2.1-dev"
 
 var (
 	httpsURLRegex = regexp.MustCompile(`https?://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(?::[0-9]+)?(/[^\s"'` + "`" + `)]*)?`)
@@ -148,10 +148,11 @@ func AnalyzeProjectAirgapAndEgressWithRules(targetDir, customRulesPath string) (
 			InspectedManifests: []string{},
 			InspectedLockfiles: []string{},
 			InspectedEnvFiles:  []EnvFileScopeInfo{},
-			LimitationsNote:    "Static scan inspects structured manifest dependency sections (ignoring dev/test/lint/docs groups), lockfile BFS dependency graphs (uv.lock, poetry.lock, package-lock.json, pnpm-lock.yaml, yarn.lock, Cargo.lock), runtime source code (known downloaders + behavioral heuristics), and .env key names (values never read or logged). Runtime code paths still require `airgap-check --run`.",
+			LimitationsNote:    "Static scan inspects production manifest sections (ignoring dev/test/lint/docs groups), lockfile dependency graphs (uv.lock, poetry.lock, package-lock.json, pnpm-lock.yaml, yarn.lock, Cargo.lock) via built-in minimal TOML/YAML/JSON readers (no external parser, so unusual formatting may be missed), runtime source code (known downloaders + generic download heuristics), and .env key names (values never read or logged). Runtime code paths require `airgap-check --run`.",
 		},
 		AirgapCrashRisks:      []CheckRiskFinding{},
 		BehavioralFindings:    []CheckRiskFinding{},
+		RobustnessHints:       []CheckRiskFinding{},
 		TelemetryLeakRisks:    []CheckRiskFinding{},
 		EgressAndSecretRisks:  []CheckRiskFinding{},
 		AllowedEgressManifest: []EgressManifestEntry{},
@@ -403,10 +404,15 @@ func AnalyzeProjectAirgapAndEgressWithRules(targetDir, customRulesPath string) (
 					}
 				}
 
-				behFindings, behHosts := AnalyzeBehavioralPatterns(relSlash, content, seenBehavioral)
+				behFindings, robHints, behHosts := AnalyzeBehavioralPatterns(relSlash, content, seenBehavioral)
 				for _, bf := range behFindings {
 					if !isCompIgnored(bf.Component, "") {
 						report.BehavioralFindings = append(report.BehavioralFindings, bf)
+					}
+				}
+				for _, rh := range robHints {
+					if !isCompIgnored(rh.Component, "") {
+						report.RobustnessHints = append(report.RobustnessHints, rh)
 					}
 				}
 				for h, src := range behHosts {

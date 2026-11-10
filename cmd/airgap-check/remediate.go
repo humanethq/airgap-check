@@ -21,6 +21,8 @@ func formatDependencyScopeBadge(scope string) string {
 		return "SOURCE CALL"
 	case "behavioral_heuristic":
 		return "BEHAVIORAL HEURISTIC"
+	case "robustness_hint":
+		return "ROBUSTNESS HINT"
 	default:
 		return "DETECTED"
 	}
@@ -84,9 +86,9 @@ func printCheckReportHuman(out io.Writer, r *CheckReport, showFix bool) {
 	}
 	_, _ = fmt.Fprintln(out)
 
-	_, _ = fmt.Fprintf(out, "2. BEHAVIORAL & UNKNOWN-LIBRARY PATTERNS (%d found)\n", len(r.BehavioralFindings))
+	_, _ = fmt.Fprintf(out, "2. BEHAVIORAL & UNKNOWN-LIBRARY DOWNLOAD PATTERNS (%d found)\n", len(r.BehavioralFindings))
 	if len(r.BehavioralFindings) == 0 {
-		_, _ = fmt.Fprintln(out, "   • No generic remote asset URLs, subprocess installers, unbounded timeouts, or hardcoded ~/.cache writes detected.")
+		_, _ = fmt.Fprintln(out, "   • No generic remote asset URLs, subprocess installers, or hardcoded ~/.cache downloads detected.")
 	} else {
 		for _, f := range r.BehavioralFindings {
 			_, _ = fmt.Fprintf(out, "   • [%s | %s] %s (%s)\n", f.Severity, f.Category, f.Component, f.SourceFile)
@@ -147,10 +149,21 @@ func printCheckReportHuman(out io.Writer, r *CheckReport, showFix bool) {
 		}
 	}
 	_, _ = fmt.Fprintln(out)
-	_, _ = fmt.Fprintf(out, "6. RECOMMENDED OFFLINE ENV FLAGS (pass `--fix` for a ready-to-paste Dockerfile block)\n   %s\n", strings.Join(r.HermeticBuildEnv, " "))
+	_, _ = fmt.Fprintf(out, "6. ROBUSTNESS HINTS — ADVISORY, NOT ASSET DOWNLOADS (%d found)\n", len(r.RobustnessHints))
+	if len(r.RobustnessHints) == 0 {
+		_, _ = fmt.Fprintln(out, "   • No unbounded requests/urllib calls without timeout= detected.")
+	} else {
+		for _, h := range r.RobustnessHints {
+			_, _ = fmt.Fprintf(out, "   • [%s] %s (%s)\n", h.Severity, h.Component, h.SourceFile)
+			_, _ = fmt.Fprintf(out, "     Impact   : %s\n", h.FailureImpact)
+			_, _ = fmt.Fprintf(out, "     Action   : %s\n", h.Mitigation)
+		}
+	}
+	_, _ = fmt.Fprintln(out)
+	_, _ = fmt.Fprintf(out, "7. RECOMMENDED OFFLINE ENV FLAGS (pass `--fix` for a ready-to-paste Dockerfile block)\n   %s\n", strings.Join(r.HermeticBuildEnv, " "))
 	if showFix && r.RemediationDockerfileSnippet != "" {
 		_, _ = fmt.Fprintln(out)
-		_, _ = fmt.Fprintln(out, "7. STANDALONE DOCKERFILE REMEDIATION (`--fix` — paste into your Dockerfile)")
+		_, _ = fmt.Fprintln(out, "8. STANDALONE DOCKERFILE REMEDIATION (`--fix` — paste into your Dockerfile)")
 		for _, line := range strings.Split(r.RemediationDockerfileSnippet, "\n") {
 			_, _ = fmt.Fprintf(out, "   %s\n", line)
 		}
@@ -248,13 +261,10 @@ func generateRemediationDockerfileSnippet(r *CheckReport) string {
 		}
 	}
 
-	hasTimeoutWarning := false
+	hasTimeoutWarning := len(r.RobustnessHints) > 0
 	var behavioralHosts []string
 	seenBHost := make(map[string]bool)
 	for _, bf := range r.BehavioralFindings {
-		if bf.Category == "behavioral_unbounded_http_timeout" {
-			hasTimeoutWarning = true
-		}
 		for _, h := range bf.EgressHosts {
 			if !seenBHost[h] {
 				seenBHost[h] = true
@@ -275,7 +285,7 @@ func generateRemediationDockerfileSnippet(r *CheckReport) string {
 		b.WriteString(fmt.Sprintf("\n# ACTION: Pre-fetch or mock assets served from dynamically/behaviorally detected hosts: %s\n", strings.Join(behavioralHosts, ", ")))
 	}
 	if hasTimeoutWarning {
-		b.WriteString("# ACTION: Add explicit timeout=(2, 10) to requests/urllib HTTP calls flagged in Section 2 to avoid infinite hangs.\n")
+		b.WriteString("# ACTION: Add explicit timeout=(2, 10) to requests/urllib HTTP calls flagged in Section 6 (Robustness Hints) to avoid infinite hangs.\n")
 	}
 
 	b.WriteString("# --- END AIR-GAP & TELEMETRY REMEDIATION ---")

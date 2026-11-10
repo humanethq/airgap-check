@@ -585,12 +585,14 @@ func isPlaceholderExampleHostOrLine(host, lineLower string) bool {
 }
 
 // AnalyzeBehavioralPatterns scans non-test runtime source files for generalizable air-gap
-// anti-patterns without requiring prior knowledge of specific third-party package names.
-func AnalyzeBehavioralPatterns(relSlash, content string, seen map[string]bool) ([]CheckRiskFinding, map[string]string) {
+// download anti-patterns (returned in findings) and non-download resilience warnings such
+// as HTTP client calls omitting timeout= (returned separately in hints).
+func AnalyzeBehavioralPatterns(relSlash, content string, seen map[string]bool) ([]CheckRiskFinding, []CheckRiskFinding, map[string]string) {
 	var findings []CheckRiskFinding
+	var hints []CheckRiskFinding
 	hosts := make(map[string]string)
 	if isBehavioralNoisePath(relSlash) {
-		return findings, hosts
+		return findings, hints, hosts
 	}
 
 	lowerPath := strings.ToLower(relSlash)
@@ -741,15 +743,15 @@ func AnalyzeBehavioralPatterns(relSlash, content string, seen map[string]bool) (
 		}
 
 		if noTimeoutCount > 0 {
-			key := "behavioral_timeout|" + relSlash
+			key := "robustness_timeout|" + relSlash
 			if !seen[key] {
 				seen[key] = true
-				findings = append(findings, CheckRiskFinding{
-					Category:         "behavioral_unbounded_http_timeout",
-					Severity:         "MEDIUM",
+				hints = append(hints, CheckRiskFinding{
+					Category:         "robustness_hint",
+					Severity:         "LOW",
 					Component:        fmt.Sprintf("HTTP client without timeout (%d call(s))", noTimeoutCount),
 					SourceFile:       fmt.Sprintf("%s:%d", relSlash, noTimeoutFirstLine),
-					DependencyScope:  "behavioral_heuristic",
+					DependencyScope:  "robustness_hint",
 					ExecutionContext: "server_runtime",
 					FailureImpact:    "Python requests/urllib call omits timeout= (defaults to infinite wait / ~127s OS TCP retry under DROP firewalls).",
 					Mitigation:       "Always set explicit short connect/read timeouts (e.g. timeout=(2, 10)) so isolated workers fail fast instead of deadlocking.",
@@ -776,7 +778,7 @@ func AnalyzeBehavioralPatterns(relSlash, content string, seen map[string]bool) (
 		}
 	}
 
-	return findings, hosts
+	return findings, hints, hosts
 }
 
 func sliceUntilBalancedParenStatus(s string) (string, bool) {

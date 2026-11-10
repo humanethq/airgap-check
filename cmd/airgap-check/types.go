@@ -22,7 +22,7 @@ type CheckRiskFinding struct {
 	Severity         string   `json:"severity"`
 	Component        string   `json:"component"`
 	SourceFile       string   `json:"source_file"`
-	DependencyScope  string   `json:"dependency_scope,omitempty"` // "prod", "optional_extra", "transitive_lockfile", "source_call", "behavioral_heuristic"
+	DependencyScope  string   `json:"dependency_scope,omitempty"` // "prod", "optional_extra", "transitive_lockfile", "source_call", "behavioral_heuristic", "robustness_hint"
 	ExecutionContext string   `json:"execution_context"`          // "server_runtime" or "browser_client"
 	EgressHosts      []string `json:"egress_hosts,omitempty"`
 	FailureImpact    string   `json:"failure_impact"`
@@ -56,6 +56,7 @@ type CheckReport struct {
 	Scope                        CheckScope             `json:"scope"`
 	AirgapCrashRisks             []CheckRiskFinding     `json:"airgap_crash_risks"`
 	BehavioralFindings           []CheckRiskFinding     `json:"behavioral_findings"`
+	RobustnessHints              []CheckRiskFinding     `json:"robustness_hints"`
 	TelemetryLeakRisks           []CheckRiskFinding     `json:"telemetry_leak_risks"`
 	EgressAndSecretRisks         []CheckRiskFinding     `json:"egress_and_secret_risks"`
 	AllowedEgressManifest        []EgressManifestEntry  `json:"allowed_egress_manifest"`

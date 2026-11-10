@@ -278,12 +278,30 @@ def fetch_custom():
 	for _, want := range []string{
 		"behavioral_asset_download",
 		"behavioral_subprocess_download",
-		"behavioral_unbounded_http_timeout",
 		"behavioral_cache_dir_write",
 	} {
 		if !cats[want] {
 			t.Fatalf("expected behavioral category %s, got %+v", want, report.BehavioralFindings)
 		}
+	}
+	if cats["behavioral_unbounded_http_timeout"] || cats["robustness_hint"] {
+		t.Fatalf("unbounded HTTP timeout must not pollute BehavioralFindings: %+v", report.BehavioralFindings)
+	}
+	if len(report.RobustnessHints) != 1 || report.RobustnessHints[0].Category != "robustness_hint" {
+		t.Fatalf("expected missing timeout= warning in RobustnessHints, got %+v", report.RobustnessHints)
+	}
+
+	// Timeout-only repos must remain clean of air-gap download findings in Verdict.
+	timeoutOnlyDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(timeoutOnlyDir, "client.py"), []byte("import requests\nresp = requests.get('https://api.internal.local/health')\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	toReport, err := AnalyzeProjectAirgapAndEgress(timeoutOnlyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(toReport.RobustnessHints) != 1 || len(toReport.BehavioralFindings) != 0 || strings.Contains(toReport.AirgapReadinessVerdict, "ACTION_REQUIRED") {
+		t.Fatalf("expected robustness_hint alone not to trigger ACTION_REQUIRED verdict, got %+v", toReport)
 	}
 
 	var hasCustomHost, hasIgnoredHost bool
