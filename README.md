@@ -12,11 +12,11 @@ None of this is a bug in those libraries. They download once and cache. It only 
 
 ## What it does
 
-- **Manifest & lockfile scan.** Inspects `requirements*.txt`, `pyproject.toml`, `Pipfile`, `package.json`, `Cargo.toml`, `go.mod`, and `Gemfile` (skipping `devDependencies`, `[dependency-groups]`, and `dev`/`test`/`lint`/`docs` groups), and follows lockfiles (`uv.lock`, `poetry.lock`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `Cargo.lock`) from production roots with explicit scope tags (`prod`, `transitive_lockfile`, `optional_extra`). Reads these files with a built-in minimal TOML/YAML reader (no external parser), so unusual formatting may be missed.
-- **Source patterns & heuristics.** Flags known runtime fetch calls (`nltk.download()`, `from_pretrained()`, `tiktoken.get_encoding()`, `whisper.load_model()`, `easyocr.Reader()`, `RapidOCR()`, `PaddleOCR()`, `FlagModel`/`FlagReranker`, `TextEmbedding()`, `next/font/google`) while ignoring comments and `local_files_only=True`, plus generic asset URLs (`.onnx`, `.safetensors`, `.gguf`, `model_prices_and_context_window.json`), `urlretrieve()`, runtime `pip install`/`ollama pull`, and `~/.cache` writes. Missing HTTP `timeout=` calls are reported separately as advisory `robustness_hints`.
-- **Python and Node `--run`.** Runs your app or probe inside `docker run --rm --network none` with a loopback sinkhole (`UDP:53` DNS, `TCP:443` TLS SNI, `TCP:80` HTTP Host/Path with query strings stripped, `HTTP_PROXY` fallback) and Python/Node socket hooks.
-- **`--fix` & custom rules.** Prints Dockerfile `ENV` flags and pre-warming commands, and supports repo overrides via `.airgap-check.json` or `--rules`.
-- **`.env` keys.** Classifies `.env*` key names and `git ls-files` status only; secret values are never read or logged.
+- **Manifest & lockfile scan.** Inspects `requirements*.txt`, `pyproject.toml`, `Pipfile`, `package.json`, `Cargo.toml`, `go.mod`, and `Gemfile` (promoting `[tool.uv] default-groups`, preserving `[tool.setuptools.dynamic.optional-dependencies]`, skipping `devDependencies` / `[dependency-groups]` `dev`/`test`/`lint`/`docs`, and suppressing `spacy` when a model wheel URL is pinned), and follows lockfiles (`uv.lock`, `poetry.lock`, `package-lock.json`, `pnpm-lock.yaml` v9 multi-doc including `peerDependenciesMeta` optional edges, `yarn.lock`, `Cargo.lock`) with explicit scope tags (`prod`, `transitive_lockfile`, `optional_extra`). Reads these files with a built-in minimal TOML/YAML reader (no external parser), so unusual formatting may be missed.
+- **Source patterns & heuristics.** Flags known runtime fetch calls (`nltk.download()`, `spacy.load()`, `gtts.gTTS()`, `from_pretrained()`, `tiktoken.get_encoding()`, `whisper.load_model()`, `easyocr.Reader()`, `RapidOCR()`, `PaddleOCR()`, `FlagModel`/`FlagReranker`, `TextEmbedding()`, `next/font/google`), skipping comments, docstrings (without inverting on multiline string expressions), Vertex AI `TextEmbeddingModel.from_pretrained()`, non-runtime build/eval/test scripts (`conftest.py`), hash-verification tables, UI placeholders/links, and `local_files_only=True`. Also flags split-line asset URLs (`.onnx`, `.safetensors`, `.gguf`, `model_prices_and_context_window.json`), runtime pricing/update checks (`models.dev`, `pypi.org`, GitHub releases, `updates.*`), `urlretrieve()`, multiline `subprocess` installers (`pip install`, `curl`, `git clone`, `ollama pull`), hardcoded `~/.cache` writes, and direct stdlib telemetry endpoints (`eu.i.posthog.com`, `otel.*`, `/v1/traces/ingest`). Missing HTTP `timeout=` calls are reported separately as advisory `robustness_hints`.
+- **Python and Node `--run`.** Runs your app or probe inside `docker run --rm --network none` (overriding baked `ENTRYPOINT`, logging to a `fsync`-backed bind-mounted host file with `docker rm -f` cleanup on timeout, and waiting briefly via `/proc` for detached `atexit` child senders) with a loopback sinkhole (`UDP:53` DNS, `TCP:443` TLS SNI, `TCP:80` HTTP Host/Path with query strings stripped, `HTTP_PROXY` fallback) and Python/Node socket hooks.
+- **`--fix` & custom rules.** Prints Dockerfile `ENV` flags (including `OPENAI_AGENTS_DISABLE_TRACING=1`, `CHROMA_TELEMETRY_IMPL=none`) and pre-warming commands, and supports repo overrides via `.airgap-check.json` or `--rules`.
+- **`.env` keys.** Classifies `.env*` key names and `git ls-files` status only (excluding non-secret LLM token-limit knobs); secret values are never read or logged.
 
 Go standard library only. `--run` requires Docker.
 
@@ -81,6 +81,7 @@ ENV DO_NOT_TRACK=1 \
     GRADIO_ANALYTICS_ENABLED=False \
     LITELLM_LOCAL_MODEL_COST_MAP=True \
     STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
+    OPENAI_AGENTS_DISABLE_TRACING=1 \
     XDG_CACHE_HOME=/app/.cache \
     TIKTOKEN_CACHE_DIR=/app/.cache/tiktoken \
     HF_HOME=/app/.cache/huggingface \
@@ -101,15 +102,17 @@ RUN HOME=/app XDG_CACHE_HOME=/app/.cache python3 -c "from chromadb.utils.embeddi
 
 ## How `--run` works, and where it stops
 
-`--run` starts a container with `--network none`, mounts your repository read-only, and injects an isolated loopback observer (`runner.py` in Python containers, or `runner.js` in Node-only containers; pass `--build` to build the repo's `Dockerfile` first):
+`--run` starts a uniquely named ephemeral container (`--rm --network none --entrypoint ""`), mounts your repository read-only alongside a bind-mounted, `fsync`-flushed `attempts.jsonl` log, and injects an isolated loopback observer (`runner.py` in Python containers, or `runner.js` in Node-only containers; pass `--build` to build the repo's `Dockerfile` first):
 
 - **Loopback DNS sinkhole (`127.0.0.1:53/udp`)** with `/etc/resolv.conf` updated inside the ephemeral container. In the default `sinkhole` mode (`--dns-action sinkhole`), `A` queries resolve to `127.0.0.1` so outbound connections continue to our loopback TLS/HTTP listeners rather than dying at DNS before showing their HTTP path or SNI hostname. Pass `--dns-action nxdomain` to fail immediately at DNS resolution.
 - **TLS `ClientHello` SNI (`127.0.0.1:443`) & HTTP (`127.0.0.1:80`) sinkholes**, plus an `HTTP_PROXY`/`HTTPS_PROXY` loopback `CONNECT` fallback when running as a non-root container user without bind privileges on ports `< 1024`. Query strings are stripped from captured URLs.
-- **Python (`sitecustomize.py`) & Node (`node_preload.js`) socket hooks** recording `socket.getaddrinfo`, `socket.connect`, `dns.lookup`, and `net.Socket.connect`.
+- **Python (`sitecustomize.py`) & Node (`node_preload.js`) socket hooks** recording `socket.getaddrinfo` (including Python `bytes` hosts), `socket.connect`, `dns.lookup` / `dns.promises.lookup`, and `net.Socket.connect` (covering Node 20 `fetch()` / `http` / `https`).
+- **Timeout & detached-process handling:** After the main process exits, the runner polls `/proc` briefly (up to 1 s) so detached `atexit` background telemetry processes finish writing before log collection. On host timeout (`TIMEOUT_EXCEEDED_IN_AIRGAP`), `airgap-check` runs `docker rm -f` on the named container and preserves attempts written prior to timeout via the bind-mounted log. Non-zero exit or caught silent egress sets `crashed_in_airgap` (with `SILENT_EGRESS_ATTEMPTED_AND_DROPPED` when a command exits `0` after attempting outbound egress). Error-text fallback URL extraction ignores traceback documentation links (`errors.pydantic.dev`, `cloud.google.com`, `sharp.pixelplumbing.com`, etc.).
 
 Limits:
 
-- Loopback sinkholes (`runner.py` and `runner.js`) were validated in real `docker run --network none` containers for both Python (`python:3.12-slim-bookworm`) and pure Node.js (`node:20-bookworm-slim`). Other runtimes without Python or Node fall back to `shell_only` error URL extraction and are not separately validated.
+- Loopback sinkholes (`runner.py` and `runner.js`) were validated in real `docker run --network none` containers for Python (`python:3.12-slim-bookworm`), pure Node.js (`node:20-bookworm-slim`), and built `Dockerfile` images. Other runtimes without Python or Node fall back to `shell_only` error URL extraction and are not separately validated.
+- `v0.2.2` `--run` hardening fixes (`--entrypoint ""` override, `bytes` host decoding, detached `atexit` child capture, `docker rm -f` timeout cleanup, and Node 20 `fetch()` tracking) were verified via real `docker run --rm --network none` integration tests in `go test -v ./...`; full upstream Benchmark v2 container runs were executed earlier on frozen `v0.2.1` (`47b2ddc`).
 - Traffic to hardcoded external IP addresses (not hostnames) fails with `ENETUNREACH` in the kernel without hitting loopback SNI/HTTP listeners, though `sitecustomize.py`/`node_preload.js` capture literal connect targets in Python/Node. DNS-over-HTTPS traffic skips the system resolver unless SNI reveals the DoH provider.
 - Non-root containers running compiled Go/Rust binaries that ignore `HTTP_PROXY` and cannot bind ports 53/80/443 inside the unprivileged user namespace will log `ENETUNREACH` rather than SNI unless run as root inside the throwaway test container.
 - Only the code paths you exercise are tested. Use `--run-cmd` to run a smoke test that covers the paths you care about.
@@ -117,9 +120,10 @@ Limits:
 
 ## Benchmark
 
-We evaluated airgap-check on 30 open-source Python and TypeScript AI repositories across three phases: Phase 1 (10 calibration repos), Phase 2 (10 held-out repos scored with `v0.1.0` rules frozen at `8ce2f11`, then re-used to design `v0.2.0`), and Phase 3 (10 fresh held-out repos scored strictly out-of-sample with `v0.2.1` rules frozen at `47b2ddc`).
+We evaluated `airgap-check` across three probe-based phases (30 Python and TypeScript AI repositories documented in [`benchmark/REPOS.md`](benchmark/REPOS.md): Phase 1 calibration, Phase 2 held-out `v0.1.0` -> `v0.2.0` design, and Phase 3 out-of-sample `v0.2.1`) plus an independent quickstart/`strace` validation suite (**Benchmark v2**, 10 pre-registered repositories + Backup B1 `AutoGPT` documented in [`benchmark/REPOS2.md`](benchmark/REPOS2.md)):
 
-These are probe-based tests: we did not start the applications themselves. A “true positive” means the flagged library fetches something when its call runs offline (or executes a runtime installer/download); it does not prove the repository reaches that call in normal operation. Telemetry findings (for example langsmith, posthog or sentry) and advisory `robustness_hints` (`timeout=` omissions) are not scored in precision/recall. Exact probe commands, upstream URLs, and commit SHAs are documented in [`benchmark/REPOS.md`](benchmark/REPOS.md).
+- Phases 2 & 3 are probe-based tests: we did not start the applications themselves. A “true positive” means the flagged library fetches something when its call runs offline (or executes a runtime installer/download); it does not prove the repository reaches that call in normal operation. Telemetry findings (for example langsmith, posthog or sentry) and advisory `robustness_hints` (`timeout=` omissions) are not scored in precision/recall.
+- Benchmark v2 removes that circularity by running **both** `(b)` documented application startup/import/CLI commands under `docker run --rm --network none` + raw `strace -f` (`ENETUNREACH` independent ground truth) **and** `(a)` static-derived probes against frozen `v0.2.1` (`47b2ddc`), before fixing the exposed bugs in `v0.2.2`.
 
 ### What the libraries do offline
 
@@ -189,6 +193,41 @@ At finding level (`v0.2.1`, out-of-sample): **53 true positives, 4 false positiv
 
 Per-repository SHAs, manifests, lockfiles, scan durations, and probe transcripts are recorded in [`benchmark/REPOS.md`](benchmark/REPOS.md).
 
+### Benchmark v2 held-out + quickstart/`strace` validation (`v0.2.1`, rules frozen at `47b2ddc`)
+
+To break probe circularity and test non-Python heavy apps, Node backends, Go rewrites, and negative controls (`openai-agents-python`, `LibreChat`), we froze `v0.2.1` at `47b2ddc`, pre-registered 10 target repos + Backup B1 `AutoGPT` in [`benchmark/REPOS2.md`](benchmark/REPOS2.md), and ran documented quickstarts/CLIs under raw `strace -f` inside `--network none` alongside static probes (`ragflow` was replaced dynamically by B1 `AutoGPT` because its multi-stage `Dockerfile` + multi-GB `ragflow_deps` image exceeded the 20-minute build cap):
+
+| Repository | `(b)` Quickstart / CLI (`--network none` + `strace`) & `(a)` Probe | TP | FP | FN |
+| :--- | :--- | :-: | :-: | :-: |
+| `open-webui` | `uvicorn` boots & seeds SQLite (`22,481 ms`, exit `137`) trying HF embeddings (`13,067 ms`) & `api.github.com` release check; `(a)` crashes on `tiktoken`/`chromadb`/`faster-whisper`/`unstructured`/`playwright`/`spacy` (`rapidocr` blank-image clean) | 14 | 0 | 4 |
+| `anything-llm` | Node `server/index.js` exits `0` (`SILENT_EGRESS`, `5,371 ms`) fetching **`models.dev`** & `raw.githubusercontent.com`; `(a)` `tesseract.js` (`cdn.jsdelivr.net`), `@xenova/transformers` fail; `js-tiktoken` clean | 4 | 0 | 3 |
+| `dify` | `flask db --help` / `import app` clean; `check_version_update` hits **`updates.dify.ai`** (`9,572 ms`); telemetry hits `otel.dify.ai`; `(a)` `tiktoken`/`transformers`/`chromadb`/`nltk`/`spacy` fail | 7 | 1 | 2 |
+| `ragflow` | *Container build blocked (>20 min `ragflow_deps` multi-stage).* Go backend (`localBpeLoader`) is disk-only in source; all 5 `v0.2.1` findings were FPs (build/eval scripts + Go hash map) | 0 | 5 | 0 |
+| `haystack` | Default `DocumentSplitter()` clean aside from `eu.i.posthog.com` (`1,582 ms`); `split_by="sentence"` crashes (`nltk`); `(a)` `tiktoken`/`nltk` fail | 5 | 0 | 0 |
+| `browser-use` | `--help` exits `0` cleanly (`187 ms`); `ProductTelemetry().flush()` hits **`eu.i.posthog.com`** (`1,831 ms`, `SILENT_EGRESS`); `(a)` `tiktoken` fails | 1 | 0 | 0 |
+| `aider` | `aider --no-git --yes --exit --model gpt-4o` tries **`pypi.org`** (`versioncheck.py`) & **`raw.githubusercontent.com`** (`models.py` + `litellm`, `1,518 ms`); `(a)` `tiktoken` fails | 7 | 0 | 2 |
+| `Flowise` | `bin/run start` clean for 28 s (`exit 137`); `(a)` **`langchainhub`** (`563 ms`, `api.hub.langchain.com`), `playwright`, `puppeteer` fail; `@dqbd/tiktoken` clean (`429 ms`) | 3 | 0 | 2 |
+| `openai-agents-python` | **Negative control 1:** `Agent()` clean (`752 ms`); `Runner.run_sync()` emits background tracing to **`api.openai.com/v1/traces/ingest`** unless `OPENAI_AGENTS_DISABLE_TRACING=1` | 1 | 0 | 4 |
+| `LibreChat` | **Negative control 2:** `countTokens()` clean (`1,518 ms`, 0 network syscalls); server connects only to loopback MongoDB (`127.0.0.1:27017`) | 0 | 0 | 0 |
+| `AutoGPT` *(Backup B1)* | `autogpt --help` & `import` clean; `autogpt run` (`TELEMETRY_OPT_IN=true`) crashes via `sentry_sdk`->`tiktoken`; `gtts` hits `translate.google.com`; **`spacy` wheel pin clean** (`exit 0`) | 6 | 3 | 2 |
+
+At finding level on frozen `v0.2.1` (`47b2ddc`, strictly out-of-sample):
+- **Pre-registered Primary 10 (`#1–#10`, including `ragflow` static)**: `42 TP`, `6 FP`, `17 FN` (**87.5% precision**, **71.2% recall**)
+- **Executable 10 (`#1–#3, B1, #5–#10`, substituting B1 `AutoGPT` for blocked `ragflow` container)**: `48 TP`, `4 FP`, `19 FN` (**92.3% precision**, **71.6% recall**)
+- **All 11 Scanned (`#1–#10 + B1`)**: `48 TP`, `9 FP`, `19 FN` (**84.2% precision**, **71.6% recall**)
+
+What independent `(b)` quickstarts/`strace` uncovered that static-only benchmarks missed:
+- **False positives (`9`)**: `dify` pnpm v9 optional `peerDependenciesMeta` edge (`next@16.4.5` -> `@playwright/test`), `ragflow` build/dev scripts (`download_deps.py`, `gen_tokenizer_oracle.py`) + Go hash verification table (`expectedBpeHashes`), and `AutoGPT` eval CLI scripts (`eval/prefix.py`, `eval_corpus.py`) + pinned `en-core-web-sm` wheel URL.
+- **False negatives (`19`)**: runtime API/update checks (`models.dev/api.json`, `pypi.org/pypi/.../json`, `api.github.com/.../releases`, `updates.dify.ai`), multiline Python expression strings (`MODEL_INFO_URL = """..."""`) inverting docstring masking in `aider`, `[tool.uv] default-groups`, `uv.lock` optional-extra BFS (`spacy` under `unstructured`, `huggingface-hub`/`tiktoken` under `litellm`), multiline `subprocess.run(["git", "clone", ...])`, `gtts`, `tesseract.js`, `kokoro-js`, and `langchainhub`.
+- **Unscored telemetry & `--run` observer bugs**: custom stdlib senders without SDK packages (`browser-use`, `dify`, `haystack`, `openai-agents` `/v1/traces/ingest`), `ENTRYPOINT` hijack on pre-built images, Python `bytes` host formatting (`b'...'`), noisy traceback doc URLs (`errors.pydantic.dev`, `sharp.pixelplumbing.com`), and timeout / detached-`atexit` log races.
+
+### `v0.2.2` post-diagnosis fixes (same Benchmark v2 commits, NOT out-of-sample)
+
+> These 11 Benchmark v2 repositories were used to diagnose and design the `v0.2.2` fixes, so static re-scan numbers below are **in-sample verification**, **NOT** out-of-sample generalization metrics.
+
+- Fixes all 9 `v0.2.1` Benchmark v2 false positives and all 19 false negatives on the pinned Benchmark v2 snapshots (`67 TP`, `0 FP`, `0 FN` on static re-scan; plus 3 `.env` token-limit FPs removed on `ragflow` and custom stdlib telemetry URLs surfaced in `browser-use`, `dify`, `haystack`, and `openai-agents-python` while filtering UI credential/placeholder forms and `conftest.py` test files).
+- Fixes all 4 `--run` observer issues (`--entrypoint ""`, bind-mounted `fsync` log + `docker rm -f` on timeout, Python `bytes` decoding, `/proc` detached-child wait, and `runtime_error_url` error-context filtering). Verified via real `docker run --rm --network none` tests in `go test -v ./...` (`18/18` passing); the 46 upstream Benchmark v2 application containers were not re-run on `v0.2.2`. Full details and per-repo deltas are in [`benchmark/REPOS2.md`](benchmark/REPOS2.md).
+
 ## Supported checks
 
 | Category | Pattern | Host(s) | `--fix` |
@@ -196,20 +235,22 @@ Per-repository SHAs, manifests, lockfiles, scan durations, and probe transcripts
 | Runtime download | `tiktoken` (Python & `tiktoken-rs`) | `openaipublic.blob.core.windows.net` | pre-warms `cl100k_base`, `o200k_base` |
 | Runtime download | `chromadb` default embedder | `chroma-onnx-models.s3.amazonaws.com` | pre-warms `ONNXMiniLM_L6_V2` |
 | Runtime download | `fastembed`, `TextEmbedding()` | `huggingface.co`, `cdn-lfs.hf.co` | pre-warms the model cache |
-| Runtime download | `sentence-transformers`, `transformers`, `@huggingface/transformers`, `from_pretrained()`, `hf_hub_download()`, `snapshot_download()` | `huggingface.co`, `cdn-lfs.hf.co` | sets offline `ENV` flags; prints model snapshot template (skips if `local_files_only=True`) |
+| Runtime download | `sentence-transformers`, `transformers`, `@huggingface/transformers`, `from_pretrained()`, `hf_hub_download()`, `snapshot_download()` | `huggingface.co`, `cdn-lfs.hf.co` | sets offline `ENV` flags; prints model snapshot template (skips `local_files_only=True` & Vertex AI SDK) |
 | Runtime download | `FlagEmbedding` (`FlagModel`, `FlagReranker`, `BGEM3FlagModel`) | `huggingface.co`, `cdn-lfs.hf.co` | sets offline `ENV` flags; prints snapshot template |
 | Runtime download | `easyocr`, `rapidocr*`, `paddleocr` | `github.com`, `releases.jaided.ai`, `huggingface.co`, `modelscope.cn`, `paddleocr.bj.bcebos.com` | pre-warms OCR weights / `EASYOCR_MODULE_PATH` |
+| Runtime download | `tesseract.js` | `cdn.jsdelivr.net`, `tessdata.projectnaptha.com` | hints pre-baking `*.traineddata` & local `langPath` |
 | Runtime download | `whisper.load_model()` / `faster-whisper` / `mlx-whisper` | `openaipublic.azureedge.net`, `huggingface.co` | pre-warms the checkpoint |
+| Runtime download | `gtts`, `gtts.gTTS()`, `kokoro`, `kokoro-js` | `translate.google.com`, `huggingface.co`, `cdn-lfs.hf.co` | flags online TTS (`gtts`) or pre-bake requirement (`kokoro*`) |
 | Runtime download | `litellm` startup cost map | `raw.githubusercontent.com` | sets `LITELLM_LOCAL_MODEL_COST_MAP=True` |
 | Runtime download | `playwright`, `puppeteer` | `playwright.azureedge.net`, `storage.googleapis.com` | installs Chromium (`python3 -m playwright` / `npx playwright` / `npx puppeteer`) |
-| Runtime download | `nltk.download()`, `spacy.cli.download()` | `raw.githubusercontent.com` | pre-downloads corpora / model wheel at build time |
-| Runtime download | `torch.hub.load()`, `timm`, `ultralytics`, `unstructured`, `surya-ocr`, `docling-ibm-models`, `kokoro` | `github.com`, `download.pytorch.org`, `huggingface.co` | flagged + `TORCH_HOME` / `HF_HOME` setup |
+| Runtime download | `nltk.download()`, `spacy.cli.download()`, `spacy.load()` | `raw.githubusercontent.com` | pre-downloads corpora / model wheel (suppresses pinned wheel URLs) |
+| Runtime download | `langchainhub` / `@langchain/hub` (`hub.pull()`), `torch.hub.load()`, `timm`, `ultralytics`, `unstructured`, `surya-ocr`, `docling-ibm-models` | `api.smith.langchain.com`, `github.com`, `download.pytorch.org`, `huggingface.co` | vendor prompt templates or pre-bake `TORCH_HOME` / `HF_HOME` |
 | Build-time download | `next/font/google` | `fonts.googleapis.com`, `fonts.gstatic.com` | flagged only; suggests `next/font/local` |
-| Behavioral heuristics | Remote `.onnx`/`.safetensors`/`.gguf`/cost-map URLs, `urlretrieve()`, archive fetch+unpack, runtime `subprocess` (`pip install`, `curl`, `wget`, `ollama pull`), hardcoded `~/.cache` writes | dynamic / inferred hosts | hints detected hosts |
+| Behavioral heuristics | Remote `.onnx`/`.safetensors`/`.gguf`/cost-map URLs (incl. split-line strings), runtime update/pricing URLs (`models.dev`, `pypi.org`, GitHub releases, `updates.*`), `urlretrieve()`, archive fetch+unpack, runtime `subprocess` (`pip install`, `curl`, `wget`, `git clone`, `ollama pull`), hardcoded `~/.cache` writes | dynamic / inferred hosts | hints detected hosts (skips hash-verification tables) |
 | Robustness hints (advisory) | Python `requests`/`urllib` HTTP calls omitting `timeout=` | — | separated into `robustness_hints`; suggests `timeout=(2, 10)` |
-| Server telemetry | `chromadb`, `crewai`, `langsmith`, `langfuse`, `wandb`, `opentelemetry-exporter-otlp`, `ddtrace`, `gradio`, `scarf` | PostHog, `telemetry.crewai.com`, `api.smith.langchain.com`, `cloud.langfuse.com`, `api.wandb.ai`, Datadog, `api.gradio.app`, `scarf.sh` | sets the matching disable flags |
-| Browser telemetry | `posthog-js`, `@sentry/*`, frontend `langsmith` | PostHog, Sentry, LangSmith | flagged only; disable the SDK in your frontend code |
-| `.env` keys | `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `STRIPE_*`, `JWT_*`, `CLOUDINARY_*`, `AWS_SECRET*` and others | n/a | flagged only; classifies key names and git tracking status |
+| Server telemetry | `chromadb`, `crewai`, `langsmith`, `langfuse`, `wandb`, `opentelemetry-exporter-otlp`, `ddtrace`, `gradio`, `scarf`, `openai-agents` (`/v1/traces/ingest`), direct stdlib PostHog/OTLP URLs | PostHog, `telemetry.crewai.com`, `otel.*`, `api.smith.langchain.com`, `cloud.langfuse.com`, `api.wandb.ai`, Datadog, `api.gradio.app`, `scarf.sh`, `api.openai.com` | sets matching disable flags (`OPENAI_AGENTS_DISABLE_TRACING=1`, `CHROMA_TELEMETRY_IMPL=none`, etc.) |
+| Browser telemetry | `posthog-js`, `@sentry/*`, frontend `langsmith` / direct URLs under `frontend/` / `web/` / `packages/ui/` | PostHog, Sentry, LangSmith | flagged only; disable the SDK in frontend code (UI placeholders/links ignored) |
+| `.env` keys | `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `STRIPE_*`, `JWT_*`, `CLOUDINARY_*`, `AWS_SECRET*` and others | n/a | flagged only; classifies key names & git tracking status (excludes token-limit knobs) |
 
 ### Custom rules (`.airgap-check.json` / `--rules`)
 

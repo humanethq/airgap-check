@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-const defaultHermeticRuntimeEnv = "DO_NOT_TRACK=1 NEXT_TELEMETRY_DISABLED=1 ANONYMIZED_TELEMETRY=False SCARF_NO_ANALYTICS=true HF_HUB_DISABLE_TELEMETRY=1 LANGCHAIN_TRACING_V2=false LANGFUSE_ENABLED=false CREWAI_DISABLE_TELEMETRY=true OTEL_SDK_DISABLED=true DD_TRACE_ENABLED=false WANDB_MODE=offline WANDB_DISABLED=true GRADIO_ANALYTICS_ENABLED=False LITELLM_LOCAL_MODEL_COST_MAP=True STREAMLIT_BROWSER_GATHER_USAGE_STATS=false XDG_CACHE_HOME=/app/.cache TIKTOKEN_CACHE_DIR=/app/.cache/tiktoken HF_HOME=/app/.cache/huggingface NLTK_DATA=/app/.cache/nltk_data EASYOCR_MODULE_PATH=/app/.cache/easyocr TORCH_HOME=/app/.cache/torch"
+const defaultHermeticRuntimeEnv = "DO_NOT_TRACK=1 NEXT_TELEMETRY_DISABLED=1 ANONYMIZED_TELEMETRY=False CHROMA_TELEMETRY_IMPL=none SCARF_NO_ANALYTICS=true HF_HUB_DISABLE_TELEMETRY=1 LANGCHAIN_TRACING_V2=false LANGFUSE_ENABLED=false CREWAI_DISABLE_TELEMETRY=true OTEL_SDK_DISABLED=true DD_TRACE_ENABLED=false WANDB_MODE=offline WANDB_DISABLED=true GRADIO_ANALYTICS_ENABLED=False LITELLM_LOCAL_MODEL_COST_MAP=True STREAMLIT_BROWSER_GATHER_USAGE_STATS=false OPENAI_AGENTS_DISABLE_TRACING=1 XDG_CACHE_HOME=/app/.cache TIKTOKEN_CACHE_DIR=/app/.cache/tiktoken HF_HOME=/app/.cache/huggingface NLTK_DATA=/app/.cache/nltk_data EASYOCR_MODULE_PATH=/app/.cache/easyocr TORCH_HOME=/app/.cache/torch"
 
 func formatDependencyScopeBadge(scope string) string {
 	switch scope {
@@ -192,6 +192,7 @@ func generateRemediationDockerfileSnippet(r *CheckReport) string {
 	b.WriteString("    GRADIO_ANALYTICS_ENABLED=False \\\n")
 	b.WriteString("    LITELLM_LOCAL_MODEL_COST_MAP=True \\\n")
 	b.WriteString("    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \\\n")
+	b.WriteString("    OPENAI_AGENTS_DISABLE_TRACING=1 \\\n")
 	b.WriteString("    XDG_CACHE_HOME=/app/.cache \\\n")
 	b.WriteString("    TIKTOKEN_CACHE_DIR=/app/.cache/tiktoken \\\n")
 	b.WriteString("    HF_HOME=/app/.cache/huggingface \\\n")
@@ -258,6 +259,10 @@ func generateRemediationDockerfileSnippet(r *CheckReport) string {
 			seenComp["puppeteer"] = true
 			b.WriteString("\n# Pre-install Puppeteer Chrome binary into PUPPETEER_CACHE_DIR during build\n")
 			b.WriteString("RUN PUPPETEER_CACHE_DIR=/app/.cache/puppeteer npx puppeteer browsers install chrome\n")
+		case strings.Contains(comp, "tesseract") && !seenComp["tesseract"]:
+			seenComp["tesseract"] = true
+			b.WriteString("\n# Pre-bake Tesseract *.traineddata language files during build and pass local langPath/cachePath\n")
+			b.WriteString("# RUN mkdir -p /app/.cache/tesseract && curl -fsSL https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata -o /app/.cache/tesseract/eng.traineddata\n")
 		}
 	}
 
@@ -282,7 +287,7 @@ func generateRemediationDockerfileSnippet(r *CheckReport) string {
 	}
 	if len(behavioralHosts) > 0 {
 		sort.Strings(behavioralHosts)
-		b.WriteString(fmt.Sprintf("\n# ACTION: Pre-fetch or mock assets served from dynamically/behaviorally detected hosts: %s\n", strings.Join(behavioralHosts, ", ")))
+		_, _ = fmt.Fprintf(&b, "\n# ACTION: Pre-fetch or mock assets served from dynamically/behaviorally detected hosts: %s\n", strings.Join(behavioralHosts, ", "))
 	}
 	if hasTimeoutWarning {
 		b.WriteString("# ACTION: Add explicit timeout=(2, 10) to requests/urllib HTTP calls flagged in Section 6 (Robustness Hints) to avoid infinite hangs.\n")

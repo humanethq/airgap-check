@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -35,7 +36,14 @@ _ORIG_CONNECT_EX = socket.socket.connect_ex
 def _record(proto, host, port=0, detail=""):
     if not host:
         return
-    h = str(host).strip().lower()
+    if isinstance(host, (bytes, bytearray)):
+        try:
+            h = bytes(host).decode("utf-8", errors="ignore")
+        except Exception:
+            h = str(host)
+    else:
+        h = str(host)
+    h = h.strip().rstrip(".").lower()
     if h in ("localhost", "127.0.0.1", "::1", "0.0.0.0", ""):
         return
     entry = {"protocol": proto, "host": h, "port": int(port or 0), "detail": str(detail or "")}
@@ -43,6 +51,11 @@ def _record(proto, host, port=0, detail=""):
         try:
             with open(_LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -77,10 +90,13 @@ const net = require('net');
 const logPath = process.env.AIRGAP_CHECK_LOG || '/tmp/airgap_check_attempts.jsonl';
 function record(proto, host, port, detail) {
   if (!host) return;
-  const h = String(host).trim().toLowerCase();
+  const h = String(host).trim().replace(/\.+$/, '').toLowerCase();
   if (!h || h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0') return;
   try {
-    fs.appendFileSync(logPath, JSON.stringify({ protocol: proto, host: h, port: Number(port || 0), detail: String(detail || '') }) + '\n');
+    const fd = fs.openSync(logPath, 'a');
+    fs.writeSync(fd, JSON.stringify({ protocol: proto, host: h, port: Number(port || 0), detail: String(detail || '') }) + '\n');
+    try { fs.fsyncSync(fd); } catch (_) {}
+    fs.closeSync(fd);
   } catch (_) {}
 }
 
@@ -101,8 +117,8 @@ if (dns.promises && typeof dns.promises.lookup === 'function') {
 const origConnect = net.Socket.prototype.connect;
 net.Socket.prototype.connect = function(...args) {
   if (args.length > 0) {
-    const first = args[0];
-    if (first && typeof first === 'object' && !Array.isArray(first)) {
+    const first = Array.isArray(args[0]) ? args[0][0] : args[0];
+    if (first && typeof first === 'object') {
       const h = first.host || first.servername;
       if (h) {
         record('tcp_connect_node', h, first.port || 0, 'net.Socket.connect');
@@ -121,6 +137,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 
 LOG_PATH = "/tmp/airgap_check_attempts.jsonl"
 DNS_ACTION = os.environ.get("AIRGAP_DNS_ACTION", "sinkhole").strip().lower()
@@ -129,15 +146,59 @@ _WRITE_LOCK = threading.Lock()
 def record(proto, host, port=0, detail=""):
     if not host:
         return
-    h = str(host).strip().lower()
+    if isinstance(host, (bytes, bytearray)):
+        try:
+            h = bytes(host).decode("utf-8", errors="ignore")
+        except Exception:
+            h = str(host)
+    else:
+        h = str(host)
+    h = h.strip().rstrip(".").lower()
     if h in ("localhost", "127.0.0.1", "::1", "0.0.0.0", ""):
         return
     with _WRITE_LOCK:
         try:
             with open(LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"protocol": proto, "host": h, "port": int(port or 0), "detail": str(detail or "")}) + "\n")
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
         except Exception:
             pass
+
+def _snapshot_proc_pids():
+    pids = set()
+    try:
+        for name in os.listdir("/proc"):
+            if name.isdigit():
+                pids.add(name)
+    except Exception:
+        pass
+    return pids
+
+def _live_new_pids(baseline):
+    live = []
+    self_pid = str(os.getpid())
+    try:
+        for name in os.listdir("/proc"):
+            if not name.isdigit() or name == self_pid or name in baseline:
+                continue
+            try:
+                with open("/proc/" + name + "/stat", "r", encoding="utf-8", errors="ignore") as sf:
+                    stat_txt = sf.read()
+                rparen = stat_txt.rfind(")")
+                if rparen >= 0:
+                    after = stat_txt[rparen+1:].lstrip()
+                    if after and after[0] == "Z":
+                        continue
+                live.append(name)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return live
 
 def parse_dns_question(data):
     pos = 12
@@ -358,7 +419,17 @@ if __name__ == "__main__":
         for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
             env.setdefault(k, purl)
 
+    baseline_pids = _snapshot_proc_pids()
     proc = subprocess.run(cmd, env=env)
+    saw_new = False
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if not _live_new_pids(baseline_pids):
+            break
+        saw_new = True
+        time.sleep(0.025)
+    if saw_new:
+        time.sleep(0.03)
     print("===AIRGAP_CHECK_LOG_BEGIN===", file=sys.stderr)
     try:
         with open(LOG_PATH, "r", encoding="utf-8") as f:
@@ -379,11 +450,44 @@ const DNS_ACTION = (process.env.AIRGAP_DNS_ACTION || 'sinkhole').trim().toLowerC
 
 function record(proto, host, port, detail) {
   if (!host) return;
-  const h = String(host).trim().toLowerCase();
+  const h = String(host).trim().replace(/\.+$/, '').toLowerCase();
   if (!h || h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0') return;
   try {
-    fs.appendFileSync(LOG_PATH, JSON.stringify({ protocol: proto, host: h, port: Number(port || 0), detail: String(detail || '') }) + '\n');
+    const fd = fs.openSync(LOG_PATH, 'a');
+    fs.writeSync(fd, JSON.stringify({ protocol: proto, host: h, port: Number(port || 0), detail: String(detail || '') }) + '\n');
+    try { fs.fsyncSync(fd); } catch (_) {}
+    fs.closeSync(fd);
   } catch (_) {}
+}
+
+function snapshotProcPids() {
+  const pids = new Set();
+  try {
+    for (const name of fs.readdirSync('/proc')) {
+      if (/^\d+$/.test(name)) pids.add(name);
+    }
+  } catch (_) {}
+  return pids;
+}
+
+function liveNewPids(baseline) {
+  const live = [];
+  const selfPid = String(process.pid);
+  try {
+    for (const name of fs.readdirSync('/proc')) {
+      if (!/^\d+$/.test(name) || name === selfPid || baseline.has(name)) continue;
+      try {
+        const statTxt = fs.readFileSync('/proc/' + name + '/stat', 'utf8');
+        const rparen = statTxt.lastIndexOf(')');
+        if (rparen >= 0) {
+          const after = statTxt.slice(rparen + 1).trimStart();
+          if (after.startsWith('Z')) continue;
+        }
+        live.push(name);
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return live;
 }
 
 function parseDnsQuestion(buf) {
@@ -602,12 +706,23 @@ function startHttpSinkhole(port) {
     env.https_proxy = env.https_proxy || purl;
   }
 
+  const baselinePids = snapshotProcPids();
   const args = process.argv.slice(2);
   const child = spawn(args[0], args.slice(1), { env, stdio: 'inherit' });
   const exitCode = await new Promise((resolve) => {
     child.on('error', () => resolve(1));
     child.on('close', (code) => resolve(code == null ? 1 : code));
   });
+  let sawNew = false;
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline) {
+    if (liveNewPids(baselinePids).length === 0) break;
+    sawNew = true;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  if (sawNew) {
+    await new Promise((r) => setTimeout(r, 30));
+  }
   process.stderr.write('\n===AIRGAP_CHECK_LOG_BEGIN===\n');
   try {
     process.stderr.write(fs.readFileSync(LOG_PATH, 'utf8'));
@@ -673,6 +788,16 @@ func RunDynamicAirgapCheck(ctx context.Context, absPath string, report *CheckRep
 		return nil, fmt.Errorf("creating temp hook dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(hookHostDir) }()
+	_ = os.Chmod(hookHostDir, 0o755)
+
+	attemptsFile, err := os.CreateTemp("", "airgap-check-attempts-*.jsonl")
+	if err != nil {
+		return nil, fmt.Errorf("creating temp attempts file: %w", err)
+	}
+	attemptsHostPath := attemptsFile.Name()
+	_ = attemptsFile.Close()
+	_ = os.Chmod(attemptsHostPath, 0o666)
+	defer func() { _ = os.Remove(attemptsHostPath) }()
 
 	if err := os.WriteFile(filepath.Join(hookHostDir, "sitecustomize.py"), []byte(airgapObserverSiteCustomizePy), 0o644); err != nil {
 		return nil, err
@@ -698,13 +823,17 @@ func RunDynamicAirgapCheck(ctx context.Context, absPath string, report *CheckRep
 		quotedCmd, quotedCmd, userCmd,
 	)
 
+	containerName := fmt.Sprintf("airgap-check-%d", time.Now().UnixNano())
 	dockerArgs := []string{
 		"run", "--rm",
+		"--name", containerName,
+		"--entrypoint", "",
 		"--network", "none",
 		"-e", "AIRGAP_CHECK_LOG=/tmp/airgap_check_attempts.jsonl",
 		"-e", "AIRGAP_DNS_ACTION=" + dnsAction,
 		"-v", fmt.Sprintf("%s:/workspace:ro", absPath),
 		"-v", fmt.Sprintf("%s:/tmp/airgap_hook:ro", hookHostDir),
+		"-v", fmt.Sprintf("%s:/tmp/airgap_check_attempts.jsonl:rw", attemptsHostPath),
 		"-w", "/workspace",
 		image,
 		"sh", "-c",
@@ -719,6 +848,12 @@ func RunDynamicAirgapCheck(ctx context.Context, absPath string, report *CheckRep
 
 	runErr := cmd.Run()
 	durationMs := time.Since(start).Milliseconds()
+	timedOut := runCtx.Err() == context.DeadlineExceeded
+	if runCtx.Err() != nil {
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = exec.CommandContext(cleanCtx, "docker", "rm", "-f", containerName).Run()
+		cleanCancel()
+	}
 
 	exitCode := 0
 	if runErr != nil {
@@ -731,8 +866,8 @@ func RunDynamicAirgapCheck(ctx context.Context, absPath string, report *CheckRep
 
 	rawStderr := stderrBuf.String()
 	observerRuntime, strippedStderr := extractObserverRuntime(rawStderr)
-	attempts, cleanStderr := extractDynamicAttemptsFromStderr(strippedStderr, stdoutBuf.String())
-	failureCat := classifyDynamicFailure(exitCode, cleanStderr, attempts)
+	attempts, cleanStderr := extractDynamicAttempts(strippedStderr, stdoutBuf.String(), attemptsHostPath)
+	failureCat := classifyDynamicFailureWithTimeout(exitCode, cleanStderr, attempts, timedOut)
 
 	return &DynamicCheckResult{
 		Executed:         true,
@@ -814,12 +949,89 @@ func stripURLQuery(rawURL string) string {
 	return rawURL
 }
 
+var (
+	enotfoundWordRe   = regexp.MustCompile(`(?i)\benotfound\b`)
+	gaierrorWordRe    = regexp.MustCompile(`(?i)\bgaierror\b`)
+	urlErrorContextRe = regexp.MustCompile(`(?i)\b(?:urlerror|httperror|connectionerror|connecterror|maxretryerror|clientconnectorerror|requestexception|urlopen error|getaddrinfo|econnrefused|enotfound|enetunreach|handshake failure|certificate verify failed|fetching|downloading|failed to (?:fetch|download|connect)|could not (?:resolve|connect|download|fetch))\b`)
+	docInviteLineRe   = regexp.MustCompile(`(?i)(?:for further information|for more details|see https?://|read the docs|documentation|migrate to)`)
+)
+
+func normalizeAttemptHost(raw string) string {
+	h := strings.TrimSpace(raw)
+	if len(h) >= 3 && (h[0] == 'b' || h[0] == 'B') &&
+		((h[1] == '\'' && h[len(h)-1] == '\'') || (h[1] == '"' && h[len(h)-1] == '"')) {
+		h = h[2 : len(h)-1]
+	}
+	h = strings.TrimSpace(h)
+	h = strings.TrimPrefix(h, "[")
+	h = strings.TrimSuffix(h, "]")
+	h = strings.TrimSuffix(h, ".")
+	return strings.ToLower(strings.TrimSpace(h))
+}
+
+func isLoopbackOrWildcardHost(h string) bool {
+	switch h {
+	case "", "localhost", "127.0.0.1", "::1", "0.0.0.0":
+		return true
+	}
+	return false
+}
+
+func isIgnoredRuntimeErrorHost(host string) bool {
+	if isIgnoredLocalOrDocHost(host) || isLoopbackOrWildcardHost(host) {
+		return true
+	}
+	switch host {
+	case "errors.pydantic.dev", "cloud.google.com", "sharp.pixelplumbing.com",
+		"pptr.dev", "playwright.dev", "developer.chrome.com", "docs.python.org", "docs.npmjs.com":
+		return true
+	}
+	return strings.HasPrefix(host, "docs.") || strings.HasPrefix(host, "errors.")
+}
+
 func extractDynamicAttemptsFromStderr(rawStderr, rawStdout string) ([]DynamicEgressAttempt, string) {
+	return extractDynamicAttempts(rawStderr, rawStdout, "")
+}
+
+func extractDynamicAttempts(rawStderr, rawStdout, attemptsHostPath string) ([]DynamicEgressAttempt, string) {
 	const beginMarker = "===AIRGAP_CHECK_LOG_BEGIN==="
 	const endMarker = "===AIRGAP_CHECK_LOG_END==="
 
-	var attempts []DynamicEgressAttempt
+	attempts := []DynamicEgressAttempt{}
 	seen := make(map[string]bool)
+
+	ingestJSONL := func(rawBlock string) {
+		for _, line := range strings.Split(rawBlock, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var att DynamicEgressAttempt
+			if err := json.Unmarshal([]byte(line), &att); err == nil {
+				att.Host = normalizeAttemptHost(att.Host)
+				if isLoopbackOrWildcardHost(att.Host) {
+					continue
+				}
+				if att.Protocol == "http_egress" {
+					att.Detail = stripURLQuery(att.Detail)
+				}
+				key := fmt.Sprintf("%s|%s|%d", att.Protocol, att.Host, att.Port)
+				if att.Protocol == "http_egress" {
+					key += "|" + att.Detail
+				}
+				if !seen[key] {
+					seen[key] = true
+					attempts = append(attempts, att)
+				}
+			}
+		}
+	}
+
+	if attemptsHostPath != "" {
+		if fileBytes, err := os.ReadFile(attemptsHostPath); err == nil && len(fileBytes) > 0 {
+			ingestJSONL(string(fileBytes))
+		}
+	}
 
 	cleanStderr := rawStderr
 	if idxBegin := strings.Index(rawStderr, beginMarker); idxBegin >= 0 {
@@ -827,43 +1039,32 @@ func extractDynamicAttemptsFromStderr(rawStderr, rawStdout string) ([]DynamicEgr
 		if idxEnd := strings.Index(after, endMarker); idxEnd >= 0 {
 			logBlock := after[:idxEnd]
 			cleanStderr = strings.TrimSpace(rawStderr[:idxBegin] + after[idxEnd+len(endMarker):])
-			for _, line := range strings.Split(logBlock, "\n") {
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
-				}
-				var att DynamicEgressAttempt
-				if err := json.Unmarshal([]byte(line), &att); err == nil && att.Host != "" {
-					if att.Protocol == "http_egress" {
-						att.Detail = stripURLQuery(att.Detail)
-					}
-					key := fmt.Sprintf("%s|%s|%d", att.Protocol, att.Host, att.Port)
-					if att.Protocol == "http_egress" {
-						key += "|" + att.Detail
-					}
-					if !seen[key] {
-						seen[key] = true
-						attempts = append(attempts, att)
-					}
-				}
-			}
+			ingestJSONL(logBlock)
 		}
 	}
 
 	combined := cleanStderr + "\n" + rawStdout
-	for _, m := range httpsURLRegex.FindAllStringSubmatch(combined, -1) {
-		if len(m) >= 2 {
-			host := strings.ToLower(strings.TrimSpace(m[1]))
-			if host != "" && !isIgnoredLocalOrDocHost(host) {
-				key := "runtime_error_url|" + host + "|443"
-				if !seen[key] {
-					seen[key] = true
-					attempts = append(attempts, DynamicEgressAttempt{
-						Protocol: "runtime_error_url",
-						Host:     host,
-						Port:     443,
-						Detail:   stripURLQuery(m[0]),
-					})
+	for _, line := range strings.Split(combined, "\n") {
+		if !strings.Contains(line, "http://") && !strings.Contains(line, "https://") {
+			continue
+		}
+		if docInviteLineRe.MatchString(line) || !urlErrorContextRe.MatchString(line) {
+			continue
+		}
+		for _, m := range httpsURLRegex.FindAllStringSubmatch(line, -1) {
+			if len(m) >= 2 {
+				host := normalizeAttemptHost(m[1])
+				if host != "" && !isIgnoredRuntimeErrorHost(host) {
+					key := "runtime_error_url|" + host + "|443"
+					if !seen[key] {
+						seen[key] = true
+						attempts = append(attempts, DynamicEgressAttempt{
+							Protocol: "runtime_error_url",
+							Host:     host,
+							Port:     443,
+							Detail:   stripURLQuery(m[0]),
+						})
+					}
 				}
 			}
 		}
@@ -873,12 +1074,25 @@ func extractDynamicAttemptsFromStderr(rawStderr, rawStdout string) ([]DynamicEgr
 }
 
 func classifyDynamicFailure(exitCode int, stderr string, attempts []DynamicEgressAttempt) string {
+	return classifyDynamicFailureWithTimeout(exitCode, stderr, attempts, false)
+}
+
+func classifyDynamicFailureWithTimeout(exitCode int, stderr string, attempts []DynamicEgressAttempt, timedOut bool) string {
+	if timedOut {
+		return "TIMEOUT_EXCEEDED_IN_AIRGAP"
+	}
+	if exitCode == 0 {
+		if len(attempts) > 0 {
+			return "SILENT_EGRESS_ATTEMPTED_AND_DROPPED"
+		}
+		return ""
+	}
 	lower := strings.ToLower(stderr)
 	switch {
 	case strings.Contains(lower, "temporary failure in name resolution") ||
-		strings.Contains(lower, "gaierror") ||
+		gaierrorWordRe.MatchString(stderr) ||
 		strings.Contains(lower, "name or service not known") ||
-		strings.Contains(lower, "enotfound"):
+		enotfoundWordRe.MatchString(stderr):
 		return "DNS_RESOLUTION_BLOCKED_IN_AIRGAP"
 	case strings.Contains(lower, "network is unreachable") ||
 		strings.Contains(lower, "connectionerror") ||
@@ -897,16 +1111,13 @@ func classifyDynamicFailure(exitCode int, stderr string, attempts []DynamicEgres
 	case strings.Contains(lower, "read-only file system") ||
 		strings.Contains(lower, "permission denied: '/root/.cache"):
 		return "READONLY_ROOTFS_CACHE_WRITE_FAILURE"
-	case exitCode != 0 && (strings.Contains(lower, "modulenotfounderror") ||
+	case strings.Contains(lower, "modulenotfounderror") ||
 		strings.Contains(lower, "no module named ") ||
-		strings.Contains(lower, "cannot find module")):
+		strings.Contains(lower, "cannot find module") ||
+		strings.Contains(lower, "err_module_not_found"):
 		return "DEPENDENCY_NOT_INSTALLED_IN_BASE_IMAGE (pass --image <built-app-image> or --build)"
-	case exitCode != 0:
-		return "NON_ZERO_EXIT_IN_AIRGAP"
-	case len(attempts) > 0:
-		return "SILENT_EGRESS_ATTEMPTED_AND_DROPPED"
 	default:
-		return ""
+		return "NON_ZERO_EXIT_IN_AIRGAP"
 	}
 }
 

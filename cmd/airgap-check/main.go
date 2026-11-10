@@ -15,11 +15,12 @@ import (
 	"time"
 )
 
-var version = "v0.2.1-dev"
+var version = "v0.2.2"
 
 var (
-	httpsURLRegex = regexp.MustCompile(`https?://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(?::[0-9]+)?(/[^\s"'` + "`" + `)]*)?`)
-	envKeyRegex   = regexp.MustCompile(`^\s*(?:export\s+)?([A-Z][A-Z0-9_]{2,})\s*=\s*(.+)$`)
+	httpsURLRegex        = regexp.MustCompile(`https?://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(?::[0-9]+)?(/[^\s"'` + "`" + `)]*)?`)
+	envKeyRegex          = regexp.MustCompile(`^\s*(?:export\s+)?([A-Z][A-Z0-9_]{2,})\s*=\s*(.+)$`)
+	spacyModelWheelPkgRe = regexp.MustCompile(`^[a-z]{2,3}-(?:core|dep|ent|sent)-(?:web|news|wiki|ud)-(?:sm|md|lg|trf)$`)
 )
 
 // normalizeCLIArgs reorders flags before positional arguments so invocations like
@@ -191,6 +192,8 @@ func AnalyzeProjectAirgapAndEgressWithRules(targetDir, customRulesPath string) (
 
 	var manifests []parsedManifestInfo
 	var lockfiles []lockfileInfo
+	dynamicProdFiles := make(map[string]bool)
+	dynamicExtraRoles := make(map[string]string) // normalized relSlash -> extraName
 
 	seenCodeRules := make(map[string]bool)
 	seenBehavioral := make(map[string]bool)
@@ -251,6 +254,19 @@ func AnalyzeProjectAirgapAndEgressWithRules(targetDir, customRulesPath string) (
 			rawBytes, err := os.ReadFile(p)
 			if err == nil {
 				deps, _ := ParseManifestFile(relSlash, lowerName, rawBytes)
+				if lowerName == "pyproject.toml" {
+					pFiles, eFiles := ParsePyprojectDynamicFileRefs(rawBytes)
+					for _, pf := range pFiles {
+						targetRel := filepath.ToSlash(filepath.Clean(filepath.Join(dirSlash, pf)))
+						dynamicProdFiles[targetRel] = true
+					}
+					for exName, files := range eFiles {
+						for _, ef := range files {
+							targetRel := filepath.ToSlash(filepath.Clean(filepath.Join(dirSlash, ef)))
+							dynamicExtraRoles[targetRel] = exName
+						}
+					}
+				}
 				manifests = append(manifests, parsedManifestInfo{
 					relSlash:  relSlash,
 					dirSlash:  dirSlash,
@@ -322,16 +338,17 @@ func AnalyzeProjectAirgapAndEgressWithRules(targetDir, customRulesPath string) (
 			}
 		}
 
-		if isSourceCodeFile(lowerName) && !isTestSourceFile(relSlash, lowerName) {
+		if isSourceCodeFile(lowerName) && !isTestSourceFile(relSlash, lowerName) && !IsNonRuntimeSourcePath(relSlash, lowerName) {
 			report.Scope.ScannedSourceFiles++
 			rawBytes, err := os.ReadFile(p)
 			if err == nil {
 				content := string(rawBytes)
 				lines := strings.Split(content, "\n")
+				nonCodeLines := BuildNonCodeLineMask(content, lowerName)
 
 				if strings.Contains(content, "next/font/google") && !seenCodeRules["next/font/google"] && !isCompIgnored("next/font/google", "") {
-					for _, rawL := range lines {
-						if isCommentLine(strings.TrimSpace(rawL)) {
+					for lineIdx, rawL := range lines {
+						if nonCodeLines[lineIdx] || isCommentLine(strings.TrimSpace(rawL)) {
 							continue
 						}
 						if strings.Contains(rawL, "next/font/google") {
@@ -361,10 +378,10 @@ func AnalyzeProjectAirgapAndEgressWithRules(targetDir, customRulesPath string) (
 				}
 				if len(candidateCodeRules) > 0 {
 					offset := 0
-					for _, rawL := range lines {
+					for lineIdx, rawL := range lines {
 						lineLen := len(rawL) + 1
 						trimmed := strings.TrimSpace(rawL)
-						if trimmed != "" && !isCommentLine(trimmed) {
+						if !nonCodeLines[lineIdx] && trimmed != "" && !isCommentLine(trimmed) {
 							for _, codeRule := range candidateCodeRules {
 								dedupKey := codeRule.component + "|" + relSlash
 								if seenCodeRules[dedupKey] {
@@ -372,6 +389,12 @@ func AnalyzeProjectAirgapAndEgressWithRules(targetDir, customRulesPath string) (
 								}
 								loc := codeRule.re.FindStringIndex(rawL)
 								if loc == nil {
+									continue
+								}
+								if strings.Contains(codeRule.component, "from_pretrained") && isManagedRemoteSDKFromPretrained(rawL) {
+									continue
+								}
+								if codeRule.component == "gtts.gTTS()" && (strings.Contains(trimmed, "def gTTS") || strings.Contains(trimmed, "class gTTS")) {
 									continue
 								}
 								if (strings.Contains(codeRule.component, "huggingface") || strings.Contains(codeRule.component, "TextEmbedding")) &&
@@ -391,10 +414,12 @@ func AnalyzeProjectAirgapAndEgressWithRules(targetDir, customRulesPath string) (
 									Mitigation:       codeRule.mitigation,
 									AutoSealedByEnv:  codeRule.autoSealed,
 								})
-								for _, h := range codeRule.hosts {
-									if !isHostIgnored(h) {
-										if _, exists := discoveredHosts[h]; !exists {
-											discoveredHosts[h] = "static_code"
+								if codeRule.component != "spacy.load()" {
+									for _, h := range codeRule.hosts {
+										if !isHostIgnored(h) {
+											if _, exists := discoveredHosts[h]; !exists {
+												discoveredHosts[h] = "static_code"
+											}
 										}
 									}
 								}
@@ -423,10 +448,28 @@ func AnalyzeProjectAirgapAndEgressWithRules(targetDir, customRulesPath string) (
 					}
 				}
 
+				telSrcFindings, telSrcHosts := AnalyzeSourceTelemetryURLs(relSlash, content, nonCodeLines, isBrowserContext, seenCodeRules)
+				for _, tf := range telSrcFindings {
+					if !isCompIgnored(tf.Component, "") {
+						report.TelemetryLeakRisks = append(report.TelemetryLeakRisks, tf)
+					}
+				}
+				for h, src := range telSrcHosts {
+					if !isHostIgnored(h) {
+						if _, exists := discoveredHosts[h]; !exists {
+							discoveredHosts[h] = src
+						}
+					}
+				}
+
 				if !isBrowserContext && (strings.Contains(content, "http://") || strings.Contains(content, "https://")) {
-					for _, rawL := range lines {
+					hasHTTP := FileHasHTTPClient(content) && HasActiveHTTPClient(lines, nonCodeLines)
+					for lineIdx, rawL := range lines {
 						trimmed := strings.TrimSpace(rawL)
-						if trimmed == "" || isCommentLine(trimmed) {
+						if nonCodeLines[lineIdx] || trimmed == "" || isCommentLine(trimmed) {
+							continue
+						}
+						if IsHashVerificationLine(rawL, content, hasHTTP) {
 							continue
 						}
 						for _, m := range httpsURLRegex.FindAllStringSubmatch(rawL, -1) {
@@ -454,8 +497,78 @@ func AnalyzeProjectAirgapAndEgressWithRules(targetDir, customRulesPath string) (
 		return nil, walkErr
 	}
 
-	// Phase 2: Evaluate parsed manifest dependencies and lockfile BFS graphs with scope priority:
+	// Phase 2: Remap setuptools dynamic optional files, sort manifests deterministically
+	// (shallowest + canonical/prod manifests first), and evaluate dependencies with scope priority:
 	// prod (3) > transitive_lockfile (2) > optional_extra (1).
+	for i := range manifests {
+		if extraName, ok := dynamicExtraRoles[manifests[i].relSlash]; ok {
+			if isDevOrNonRuntimeGroupName(extraName) {
+				manifests[i].deps = nil
+				continue
+			}
+			for j := range manifests[i].deps {
+				manifests[i].deps[j].Scope = "optional_extra"
+				manifests[i].deps[j].Extra = extraName
+			}
+		}
+	}
+
+	manifestPriority := func(m parsedManifestInfo) int {
+		if dynamicProdFiles[m.relSlash] {
+			return 0
+		}
+		switch m.lowerName {
+		case "pyproject.toml", "package.json", "cargo.toml", "go.mod", "gemfile", "pipfile":
+			return 1
+		case "requirements.txt":
+			return 2
+		default:
+			return 3
+		}
+	}
+	sort.SliceStable(manifests, func(i, j int) bool {
+		di := strings.Count(manifests[i].relSlash, "/")
+		dj := strings.Count(manifests[j].relSlash, "/")
+		if di != dj {
+			return di < dj
+		}
+		pi := manifestPriority(manifests[i])
+		pj := manifestPriority(manifests[j])
+		if pi != pj {
+			return pi < pj
+		}
+		return manifests[i].relSlash < manifests[j].relSlash
+	})
+
+	spacyPinnedByDir := make(map[string]bool)
+	for _, m := range manifests {
+		for _, dep := range m.deps {
+			if dep.Scope == "prod" && spacyModelWheelPkgRe.MatchString(dep.Name) {
+				spacyPinnedByDir[m.dirSlash] = true
+			}
+		}
+	}
+	isSpacyPinnedForDir := func(dirSlash string) bool {
+		if len(spacyPinnedByDir) == 0 {
+			return false
+		}
+		cur := filepath.ToSlash(filepath.Clean(dirSlash))
+		for {
+			if spacyPinnedByDir[cur] {
+				return true
+			}
+			if cur == "." || cur == "/" || cur == "" {
+				break
+			}
+			parent := filepath.ToSlash(filepath.Dir(cur))
+			if parent == cur {
+				break
+			}
+			cur = parent
+		}
+		return false
+	}
+
 	scopeRank := func(s string) int {
 		switch s {
 		case "prod":
@@ -472,13 +585,16 @@ func AnalyzeProjectAirgapAndEgressWithRules(targetDir, customRulesPath string) (
 	crashIndexByKey := make(map[string]int)
 	telIndexByKey := make(map[string]int)
 
-	recordDep := func(dep ManifestDep, sourceLabel string, isBrowser bool) {
+	recordDep := func(dep ManifestDep, sourceLabel, dirSlash string, isBrowser bool) {
 		rules := rulesByPkg[dep.Name]
 		for _, rule := range rules {
 			if !matchesEcosystem(rule.ecosystems, dep.Format) {
 				continue
 			}
 			if isCompIgnored(rule.component, dep.Name) {
+				continue
+			}
+			if rule.component == "spacy" && isSpacyPinnedForDir(dirSlash) {
 				continue
 			}
 			execCtx := "server_runtime"
@@ -489,7 +605,11 @@ func AnalyzeProjectAirgapAndEgressWithRules(targetDir, customRulesPath string) (
 			if isBrowser && rule.category == "telemetry_analytics" {
 				execCtx = "browser_client"
 				autoSealed = false
-				impact = fmt.Sprintf("Client-side package in %s sends telemetry from the end-user's browser to %s. In air-gapped networks the server does not crash, but browser requests fail/timeout.", sourceLabel, strings.Join(rule.hosts, ", "))
+				targetHost := strings.Join(rule.hosts, ", ")
+				if targetHost == "" {
+					targetHost = "external telemetry endpoints"
+				}
+				impact = fmt.Sprintf("Client-side package in %s sends telemetry from the end-user's browser to %s. In air-gapped networks the server does not crash, but browser requests fail/timeout.", sourceLabel, targetHost)
 				mitigation = "Server environment variables do NOT disable browser SDKs; gate SDK initialization in frontend source code."
 			}
 
@@ -550,29 +670,48 @@ func AnalyzeProjectAirgapAndEgressWithRules(targetDir, customRulesPath string) (
 	// Pass 2a: direct prod dependencies from manifests
 	allProdByDir := make(map[string][]ManifestDep)
 	var allProdGlobal []ManifestDep
+	allManifestByDir := make(map[string][]ManifestDep)
+	var allManifestGlobal []ManifestDep
 	for _, m := range manifests {
 		for _, dep := range m.deps {
+			if dep.Scope == "prod" || dep.Scope == "optional_extra" {
+				allManifestByDir[m.dirSlash] = append(allManifestByDir[m.dirSlash], dep)
+				allManifestGlobal = append(allManifestGlobal, dep)
+			}
 			if dep.Scope == "prod" {
 				allProdByDir[m.dirSlash] = append(allProdByDir[m.dirSlash], dep)
 				allProdGlobal = append(allProdGlobal, dep)
-				recordDep(dep, m.relSlash, m.isBrowser)
+				recordDep(dep, m.relSlash, m.dirSlash, m.isBrowser)
 			}
 		}
 	}
 
 	// Pass 2b: lockfile BFS graph dependencies
 	for _, lf := range lockfiles {
-		roots := allProdByDir[lf.dirSlash]
-		if len(roots) == 0 {
-			roots = allProdGlobal
+		var roots []ManifestDep
+		if lf.lowerName == "uv.lock" || lf.lowerName == "poetry.lock" {
+			roots = allManifestByDir[lf.dirSlash]
+			if len(roots) == 0 {
+				roots = allManifestGlobal
+			}
+		} else {
+			roots = allProdByDir[lf.dirSlash]
+			if len(roots) == 0 {
+				roots = allProdGlobal
+			}
 		}
 		transitive := ParseLockfileGraph(lf.absPath, lf.lowerName, roots)
+		for _, dep := range transitive {
+			if dep.Scope == "transitive_lockfile" && spacyModelWheelPkgRe.MatchString(dep.Name) {
+				spacyPinnedByDir[lf.dirSlash] = true
+			}
+		}
 		for _, dep := range transitive {
 			src := lf.relSlash
 			if dep.Via != "" {
 				src = fmt.Sprintf("%s (via %s)", lf.relSlash, dep.Via)
 			}
-			recordDep(dep, src, lf.isBrowser)
+			recordDep(dep, src, lf.dirSlash, lf.isBrowser)
 		}
 	}
 
@@ -584,9 +723,32 @@ func AnalyzeProjectAirgapAndEgressWithRules(targetDir, customRulesPath string) (
 				if dep.Extra != "" {
 					src = fmt.Sprintf("%s [extra: %s]", m.relSlash, dep.Extra)
 				}
-				recordDep(dep, src, m.isBrowser)
+				recordDep(dep, src, m.dirSlash, m.isBrowser)
 			}
 		}
+	}
+
+	// Post-Phase-2: suppress source-level spacy.load() in dirs where a spaCy model wheel is pinned,
+	// and register hosts for unsuppressed spacy.load() findings.
+	if len(report.AirgapCrashRisks) > 0 {
+		filteredCrash := make([]CheckRiskFinding, 0, len(report.AirgapCrashRisks))
+		for _, f := range report.AirgapCrashRisks {
+			if f.Component == "spacy.load()" {
+				srcDir := filepath.ToSlash(filepath.Dir(f.SourceFile))
+				if isSpacyPinnedForDir(srcDir) {
+					continue
+				}
+				for _, h := range f.EgressHosts {
+					if !isHostIgnored(h) {
+						if _, exists := discoveredHosts[h]; !exists {
+							discoveredHosts[h] = "static_code"
+						}
+					}
+				}
+			}
+			filteredCrash = append(filteredCrash, f)
+		}
+		report.AirgapCrashRisks = filteredCrash
 	}
 
 	rebuildAllowedEgressManifest(report, discoveredHosts)
@@ -655,7 +817,7 @@ func isNonEmptySecretCandidate(keyName, cleanedVal string) bool {
 }
 
 func isTestSourceFile(relSlash, lowerName string) bool {
-	if strings.Contains(relSlash, "/__tests__/") || strings.Contains(relSlash, "/test/") || strings.Contains(relSlash, "/tests/") {
+	if lowerName == "conftest.py" || strings.Contains(relSlash, "/__tests__/") || strings.Contains(relSlash, "/test/") || strings.Contains(relSlash, "/tests/") {
 		return true
 	}
 	for _, suffix := range []string{"_test.go", "_test.py", ".test.ts", ".test.tsx", ".test.js", ".spec.ts", ".spec.tsx", ".spec.js"} {
@@ -677,6 +839,7 @@ func classifyHostDestination(host string) string {
 		return "llm_inference_api"
 	case strings.Contains(h, "posthog.com") || strings.Contains(h, "sentry.io") ||
 		strings.Contains(h, "scarf.sh") || strings.Contains(h, "telemetry.crewai.com") ||
+		strings.HasPrefix(h, "otel.") || strings.HasPrefix(h, "telemetry.") || strings.Contains(h, ".otel.") ||
 		strings.Contains(h, "smith.langchain.com") || strings.Contains(h, "langfuse.com") ||
 		strings.Contains(h, "wandb.ai") || strings.Contains(h, "gradio.app") ||
 		strings.Contains(h, "datadoghq.com") || strings.Contains(h, "segment.io") ||
@@ -815,8 +978,9 @@ func isFileTrackedByGit(repoRoot, relSlash string) bool {
 }
 
 func isFrontendOrBrowserPath(relSlash, lowerName string) bool {
-	for _, prefix := range []string{"frontend/", "client/", "web/", "apps/web/", "apps/frontend/", "src/components/"} {
-		if strings.HasPrefix(relSlash, prefix) {
+	lower := strings.ToLower(relSlash)
+	for _, seg := range []string{"frontend/", "client/", "web/", "apps/web/", "apps/frontend/", "src/components/", "packages/ui/"} {
+		if strings.HasPrefix(lower, seg) || strings.Contains(lower, "/"+seg) {
 			return true
 		}
 	}
@@ -925,10 +1089,18 @@ func isSourceCodeFile(lowerName string) bool {
 
 func isSensitiveEnvKey(key string) bool {
 	upper := strings.ToUpper(key)
-	for _, token := range []string{"KEY", "SECRET", "TOKEN", "PASSWORD", "DSN", "WEBHOOK"} {
+	for _, token := range []string{"KEY", "SECRET", "PASSWORD", "DSN", "WEBHOOK"} {
 		if strings.Contains(upper, token) {
 			return true
 		}
+	}
+	if strings.Contains(upper, "TOKEN") {
+		for _, nonSecret := range []string{"_TOKENS", "TOKENS_", "TOKEN_LIMIT", "TOKEN_COUNT", "TOKEN_BUDGET", "TOKENIZER"} {
+			if strings.Contains(upper, nonSecret) {
+				return false
+			}
+		}
+		return true
 	}
 	return false
 }

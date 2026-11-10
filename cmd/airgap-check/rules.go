@@ -184,6 +184,45 @@ var knownAirgapAndTelemetryRules = []knownPackageRule{
 		mitigation: "Set PUPPETEER_CACHE_DIR=/app/.cache/puppeteer and run `npx puppeteer browsers install chrome` at build time.",
 	},
 	{
+		packages:   []string{"tesseract.js"},
+		ecosystems: []string{"node"},
+		component:  "tesseract.js",
+		category:   "runtime_model_asset",
+		severity:   "CRITICAL",
+		hosts:      []string{"cdn.jsdelivr.net", "tessdata.projectnaptha.com"},
+		impact:     "Fetches *.traineddata language files and worker WASM/JS bundles over HTTPS on first OCR call unless pre-baked locally.",
+		mitigation: "Pre-download required *.traineddata files during image build and pass local langPath/cachePath options (see `--fix`).",
+	},
+	{
+		packages:   []string{"kokoro-js"},
+		ecosystems: []string{"node"},
+		component:  "kokoro-js",
+		category:   "runtime_model_asset",
+		severity:   "CRITICAL",
+		hosts:      []string{"huggingface.co", "cdn-lfs.hf.co"},
+		impact:     "Downloads Kokoro ONNX TTS model checkpoints via Transformers.js / HuggingFace Hub on first synthesis call unless pre-baked locally.",
+		mitigation: "Pre-download Kokoro ONNX model assets during image build and configure Transformers.js with local model paths and allowRemoteModels=false.",
+	},
+	{
+		packages:   []string{"langchainhub", "@langchain/hub"},
+		component:  "langchainhub",
+		category:   "runtime_model_asset",
+		severity:   "HIGH",
+		hosts:      []string{"api.smith.langchain.com"},
+		impact:     "Fetches versioned prompt templates over HTTPS from LangSmith Hub on hub.pull() at runtime; fails offline unless bundled locally.",
+		mitigation: "Vendor prompt templates in source or local config instead of calling hub.pull() at runtime.",
+	},
+	{
+		packages:   []string{"gtts"},
+		ecosystems: []string{"python"},
+		component:  "gtts",
+		category:   "runtime_model_asset",
+		severity:   "CRITICAL",
+		hosts:      []string{"translate.google.com"},
+		impact:     "gTTS makes live HTTPS requests to Google Translate TTS at runtime and has no offline synthesis fallback.",
+		mitigation: "Replace gTTS with an offline local TTS engine whose voice weights are baked into the container image.",
+	},
+	{
 		packages:   []string{"timm", "ultralytics", "unstructured", "surya-ocr", "docling-ibm-models", "kokoro", "kokoro-onnx", "stanza", "flair"},
 		ecosystems: []string{"python"},
 		component:  "ml-weight-downloader",
@@ -308,6 +347,17 @@ var knownAirgapAndTelemetryRules = []knownPackageRule{
 		mitigation: "Set SCARF_NO_ANALYTICS=true and DO_NOT_TRACK=1 in container ENV.",
 		autoSealed: true,
 	},
+	{
+		packages:   []string{"openai-agents"},
+		ecosystems: []string{"python"},
+		component:  "openai-agents",
+		category:   "telemetry_analytics",
+		severity:   "HIGH",
+		hosts:      []string{"api.openai.com"},
+		impact:     "Exports tracing spans to api.openai.com/v1/traces/ingest by default (even when using a local LLM endpoint) unless tracing is disabled.",
+		mitigation: "Set OPENAI_AGENTS_DISABLE_TRACING=1 in container ENV or call set_tracing_disabled(True).",
+		autoSealed: true,
+	},
 }
 
 var knownExternalHostSDKs = map[string]string{
@@ -367,6 +417,26 @@ var sourceCodeDownloadRules = []sourceCodePatternRule{
 		hosts:      []string{"raw.githubusercontent.com"},
 		impact:     "Explicit spacy.cli.download() call in source code invokes pip/HTTP download at runtime.",
 		mitigation: "Install the spacy model wheel during image build instead of calling spacy.cli.download() at runtime.",
+	},
+	{
+		hints:      []string{"spacy.load"},
+		re:         regexp.MustCompile(`\bspacy\.load\s*\(`),
+		component:  "spacy.load()",
+		category:   "runtime_model_asset",
+		severity:   "HIGH",
+		hosts:      []string{"raw.githubusercontent.com"},
+		impact:     "Loads a spaCy language pipeline by name at runtime; fails if the model wheel is not pre-installed in the image.",
+		mitigation: "Pin the spaCy model wheel URL in dependencies or install it during Docker image build (see `--fix`).",
+	},
+	{
+		hints:      []string{"gtts.gTTS", "gTTS("},
+		re:         regexp.MustCompile(`\b(?:gtts\.)?gTTS\s*\(`),
+		component:  "gtts.gTTS()",
+		category:   "runtime_model_asset",
+		severity:   "CRITICAL",
+		hosts:      []string{"translate.google.com"},
+		impact:     "Invokes gTTS() online speech synthesis over HTTPS to translate.google.com; fails offline.",
+		mitigation: "Use an offline local TTS engine instead of gTTS in air-gapped deployments.",
 	},
 	{
 		hints:      []string{"from_pretrained", "hf_hub_download", "snapshot_download"},
@@ -543,27 +613,45 @@ func LoadCustomRules(targetDir, customPath string) (*LoadedCustomRules, error) {
 // --- Universal Behavioral Source-Code Analyzer (beyond hardcoded packages) ---
 
 var (
-	assetExtOrHintRe   = regexp.MustCompile(`(?i)\.(?:onnx|safetensors|gguf|ggml|ckpt|tflite|tiktoken|tar\.gz|tgz|whl|pth|pt|bin|zip)(?:$|[?"'\s#])|model_prices_and_context_window\.json|download[_-]?model|weights[_-]?url|cost_map_url`)
-	urlRetrieveRe      = regexp.MustCompile(`\b(?:urllib\.request\.urlretrieve|urlretrieve|wget\.download)\s*\(`)
-	archiveUnpackRe    = regexp.MustCompile(`\b(?:shutil\.unpack_archive|tarfile\.open|zipfile\.ZipFile)\s*\(`)
-	httpFetchHintRe    = regexp.MustCompile(`\b(?:urllib\.request|requests\.(?:get|post|Session)|httpx\.(?:get|Client|AsyncClient)|aiohttp\.ClientSession|fetch\(|axios\.get\(|http\.Get\()`)
-	subprocessNetRe    = regexp.MustCompile(`(?i)\b(?:subprocess\.(?:run|Popen|check_call|check_output|call)|os\.system|execSync|child_process\.exec|exec\.Command)\b[^\n]*(?:pip(?:\s+|["'],\s*["'])install|uv(?:\s+|["'],\s*["'])pip|playwright(?:\s+|["'],\s*["'])install|spacy(?:\s+|["'],\s*["'])download|\bcurl(?:\s+|["'],\s*["'])|\bwget(?:\s+|["'],\s*["'])|git(?:\s+|["'],\s*["'])clone(?:\s+|["'],\s*["'])https?://|ollama(?:\s+|["'],\s*["'])pull)`)
-	pyReqNoTimeoutRe   = regexp.MustCompile(`\b(?:requests\.(?:get|post|put|patch|delete|head|request)|urllib\.request\.urlopen)\s*\(`)
-	homeCacheLiteralRe = regexp.MustCompile(`(?:"~/\.cache|'~/\.cache|"/root/\.cache|'/root/\.cache|Path\.home\(\)\s*/\s*["']\.cache|os\.path\.expanduser\(\s*["']~/\.cache|user_cache_dir\s*\()`)
-	cacheEnvOverrideRe = regexp.MustCompile(`\b(?:HF_HOME|XDG_CACHE_HOME|TORCH_HOME|TIKTOKEN_CACHE_DIR|NLTK_DATA|EASYOCR_MODULE_PATH|CACHE_DIR)\b`)
+	assetExtOrHintRe         = regexp.MustCompile(`(?i)\.(?:onnx|safetensors|gguf|ggml|ckpt|tflite|tiktoken|tar\.gz|tgz|whl|pth|pt|bin|zip)(?:$|[?"'\s#])|model_prices_and_context_window\.json|download[_-]?model|weights[_-]?url|cost_map_url`)
+	runtimeMetaOrUpdateURLRe = regexp.MustCompile(`(?i)https?://(?:models\.dev/api\.json|pypi\.org/pypi/[^/\s"'` + "`" + `)]+/json|api\.github\.com/repos/[^/\s"'` + "`" + `)]+/[^/\s"'` + "`" + `)]+/releases(?:/latest)?|updates?\.[a-zA-Z0-9.-]+\.[a-z]{2,}(?:/[^\s"'` + "`" + `)]*)?)`)
+	sourceTelemetryURLRe     = regexp.MustCompile(`(?i)https?://(?:(?:us|eu|app)\.i\.posthog\.com|(?:us|eu|app)\.posthog\.com|posthog\.com(?:/batch|/capture|/decide|/e)?(?:$|[?"'\s/#])|[^/\s"'` + "`" + `)]*ingest[^/\s"'` + "`" + `)]*\.sentry\.io|telemetry\.[a-zA-Z0-9.-]+\.[a-z]{2,}|otel\.[a-zA-Z0-9.-]+\.[a-z]{2,}|cloud\.langfuse\.com|api\.smith\.langchain\.com|api\.wandb\.ai|scarf\.sh|api\.openai\.com/v1/traces/ingest)(?:/[^\s"'` + "`" + `)]*)?`)
+	urlRetrieveRe            = regexp.MustCompile(`\b(?:urllib\.request\.urlretrieve|urlretrieve|wget\.download)\s*\(`)
+	archiveUnpackRe          = regexp.MustCompile(`\b(?:shutil\.unpack_archive|tarfile\.open|zipfile\.ZipFile)\s*\(`)
+	httpFetchHintRe          = regexp.MustCompile(`\b(?:urllib\.request|requests\.(?:get|post|Session)|httpx\.(?:get|Client|AsyncClient)|aiohttp\.ClientSession|fetch\(|axios\.(?:get|post|request)|http\.(?:Get|Post|NewRequest|Client))`)
+	subprocessStartRe        = regexp.MustCompile(`\b(?:subprocess\.(?:run|Popen|check_call|check_output|call)|os\.system|execSync|child_process\.exec(?:File|Sync)?|exec\.Command)\s*\(`)
+	subprocessNetRe          = regexp.MustCompile(`(?i)\b(?:subprocess\.(?:run|Popen|check_call|check_output|call)|os\.system|execSync|child_process\.exec|exec\.Command)\b[^\n]*(?:pip(?:\s+|["'],\s*["'])install|uv(?:\s+|["'],\s*["'])pip|playwright(?:\s+|["'],\s*["'])install|spacy(?:\s+|["'],\s*["'])download|\bcurl(?:\s+|["'],\s*["'])|\bwget(?:\s+|["'],\s*["'])|git(?:\s+|["'],\s*["'])clone(?:\s+|["'],\s*["'])https?://|ollama(?:\s+|["'],\s*["'])pull)`)
+	subprocessNetActionRe    = regexp.MustCompile(`(?i)(?:pip\b[\s"',\[]+install|uv\b[\s"',\[]+pip|playwright\b[\s"',\[]+install|spacy\b[\s"',\[]+download|\bcurl\b|\bwget\b|git\b[\s"',\[]+clone|\bollama\b[\s"',\[]+pull)`)
+	adjacentStringConcatRe   = regexp.MustCompile(`(?:"\s*(?:\+\s*)?\r?\n\s*"|'\s*(?:\+\s*)?\r?\n\s*')`)
+	hashDigestPairRe         = regexp.MustCompile(`(?i)(?:"https?://[^"]+"|'https?://[^']+')\s*[:=,]\s*(?:"[0-9a-f]{32,128}"|'[0-9a-f]{32,128}')|(?:"[0-9a-f]{32,128}"|'[0-9a-f]{32,128}')\s*[:=,]\s*(?:"https?://[^"]+"|'https?://[^']+')`)
+	pyReqNoTimeoutRe         = regexp.MustCompile(`\b(?:requests\.(?:get|post|put|patch|delete|head|request)|urllib\.request\.urlopen)\s*\(`)
+	homeCacheLiteralRe       = regexp.MustCompile(`(?:"~/\.cache|'~/\.cache|"/root/\.cache|'/root/\.cache|Path\.home\(\)\s*/\s*["']\.cache|os\.path\.expanduser\(\s*["']~/\.cache|user_cache_dir\s*\()`)
+	cacheEnvOverrideRe       = regexp.MustCompile(`\b(?:HF_HOME|XDG_CACHE_HOME|TORCH_HOME|TIKTOKEN_CACHE_DIR|NLTK_DATA|EASYOCR_MODULE_PATH|CACHE_DIR)\b`)
 )
 
-func isBehavioralNoisePath(relSlash string) bool {
+// IsNonRuntimeSourcePath returns true for build-prep scripts, CI helpers, eval harnesses,
+// benchmarks, devtools, and documentation files that are not part of app runtime.
+func IsNonRuntimeSourcePath(relSlash, lowerName string) bool {
 	lower := strings.ToLower(relSlash)
 	for _, seg := range []string{
-		"ci_cd/", "scripts/", "benchmark/", "benchmarks/", "evals/", "docs/", "examples/",
-		"cookbook/", "packaging/", ".storybook/", "stories/",
+		"ci_cd/", "scripts/", "benchmark/", "benchmarks/", "direct_benchmark/",
+		"eval/", "evals/", "evaluation/", "docs/", "examples/", "cookbook/",
+		"packaging/", "devtools/", "dev_tools/", ".storybook/", "stories/",
 	} {
 		if strings.HasPrefix(lower, seg) || strings.Contains(lower, "/"+seg) {
 			return true
 		}
 	}
-	return false
+	if lowerName == "" {
+		lowerName = strings.ToLower(filepath.Base(relSlash))
+	}
+	switch lowerName {
+	case "download_deps.py", "download_dev_deps.py", "eval_corpus.py":
+		return true
+	}
+	return strings.HasSuffix(lowerName, "_oracle.py") ||
+		strings.HasSuffix(lowerName, "_eval.py") ||
+		strings.HasPrefix(lowerName, "eval_")
 }
 
 func isCommentLine(trimmed string) bool {
@@ -572,6 +660,310 @@ func isCommentLine(trimmed string) bool {
 		strings.HasPrefix(trimmed, "/*") ||
 		strings.HasPrefix(trimmed, "* ") ||
 		trimmed == "*"
+}
+
+func FileHasHTTPClient(content string) bool {
+	return (strings.Contains(content, "urllib") ||
+		strings.Contains(content, "requests.") ||
+		strings.Contains(content, "httpx.") ||
+		strings.Contains(content, "aiohttp.") ||
+		strings.Contains(content, "fetch(") ||
+		strings.Contains(content, "axios.") ||
+		strings.Contains(content, "http.Get(") ||
+		strings.Contains(content, "http.Post(") ||
+		strings.Contains(content, "http.NewRequest") ||
+		strings.Contains(content, "http.Client")) && httpFetchHintRe.MatchString(content)
+}
+
+func HasActiveHTTPClient(lines []string, nonCodeMask []bool) bool {
+	for idx, line := range lines {
+		if idx < len(nonCodeMask) && nonCodeMask[idx] {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || isCommentLine(trimmed) {
+			continue
+		}
+		if FileHasHTTPClient(line) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsHashVerificationLine returns true when a line defines a URL -> SHA/MD5 digest mapping
+// in a file that does not make outbound HTTP requests (e.g. local BPE hash tables).
+func IsHashVerificationLine(rawLine, content string, hasHTTPFetchInFile bool) bool {
+	if hasHTTPFetchInFile {
+		return false
+	}
+	return hashDigestPairRe.MatchString(rawLine)
+}
+
+func isManagedRemoteSDKFromPretrained(line string) bool {
+	for _, cls := range []string{
+		"TextEmbeddingModel.from_pretrained",
+		"MultimodalEmbeddingModel.from_pretrained",
+		"GenerativeModel.from_pretrained",
+		"ChatModel.from_pretrained",
+		"CodeGenerationModel.from_pretrained",
+		"CodeChatModel.from_pretrained",
+		"TextGenerationModel.from_pretrained",
+		"ImageGenerationModel.from_pretrained",
+		"ImageTextModel.from_pretrained",
+	} {
+		if strings.Contains(line, cls) {
+			return true
+		}
+	}
+	return false
+}
+
+func endsWithPythonExprContinuation(prev string) bool {
+	if prev == "" {
+		return false
+	}
+	for _, suf := range []string{"=", "(", "[", "{", ",", "+", "-", "*", "/", "%", "\\", "->"} {
+		if strings.HasSuffix(prev, suf) {
+			return true
+		}
+	}
+	return prev == "return" || prev == "yield" || prev == "await" ||
+		strings.HasSuffix(prev, " return") || strings.HasSuffix(prev, " yield") || strings.HasSuffix(prev, " await")
+}
+
+func pythonTripleStartOffset(trimmed string) int {
+	n := len(trimmed)
+	for prefixLen := 0; prefixLen <= 2 && prefixLen+3 <= n; prefixLen++ {
+		if prefixLen > 0 {
+			ok := true
+			for k := 0; k < prefixLen; k++ {
+				switch trimmed[k] {
+				case 'r', 'R', 'u', 'U', 'f', 'F', 'b', 'B':
+				default:
+					ok = false
+				}
+			}
+			if !ok {
+				continue
+			}
+		}
+		if trimmed[prefixLen:prefixLen+3] == `"""` || trimmed[prefixLen:prefixLen+3] == `'''` {
+			return prefixLen
+		}
+	}
+	return -1
+}
+
+// BuildNonCodeLineMask marks lines that are non-executable comments, docstrings, or doctests.
+func BuildNonCodeLineMask(content, lowerFileName string) []bool {
+	lines := strings.Split(content, "\n")
+	mask := make([]bool, len(lines))
+	isPy := strings.HasSuffix(lowerFileName, ".py")
+	isRuby := strings.HasSuffix(lowerFileName, ".rb")
+	isGo := strings.HasSuffix(lowerFileName, ".go")
+
+	if isPy {
+		// tripleMode: 0 = outside triple quote, 1 = docstring (masked), 2 = expression triple string (not masked)
+		tripleMode := 0
+		tripleDelim := ""
+		parenDepth := 0
+		prevSignificantEnd := ""
+
+		isEscapedAt := func(s string, pos int) bool {
+			bs := 0
+			for p := pos - 1; p >= 0 && s[p] == '\\'; p-- {
+				bs++
+			}
+			return bs%2 == 1
+		}
+
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if tripleMode == 0 {
+				if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ">>>") {
+					mask[i] = true
+					continue
+				}
+			}
+
+			docOffset := -1
+			if tripleMode == 0 && parenDepth == 0 && !endsWithPythonExprContinuation(prevSignificantEnd) {
+				docOffset = pythonTripleStartOffset(trimmed)
+			}
+
+			enteredDocstringThisLine := false
+			closedDocstringThisLine := false
+			hasNonDocCodeThisLine := false
+			var singleQuote byte
+			codeEnd := len(trimmed)
+
+			for j := 0; j < len(trimmed); {
+				if tripleMode != 0 {
+					if j+3 <= len(trimmed) && trimmed[j:j+3] == tripleDelim && !isEscapedAt(trimmed, j) {
+						wasDoc := tripleMode == 1
+						tripleMode = 0
+						tripleDelim = ""
+						j += 3
+						if wasDoc {
+							closedDocstringThisLine = true
+						} else {
+							hasNonDocCodeThisLine = true
+						}
+						continue
+					}
+					j++
+					continue
+				}
+
+				if singleQuote != 0 {
+					hasNonDocCodeThisLine = true
+					if trimmed[j] == '\\' && j+1 < len(trimmed) {
+						j += 2
+						continue
+					}
+					if trimmed[j] == singleQuote {
+						singleQuote = 0
+					}
+					j++
+					continue
+				}
+
+				c := trimmed[j]
+				if c == '#' {
+					codeEnd = j
+					break
+				}
+				if (c == '"' || c == '\'') && j+3 <= len(trimmed) && (trimmed[j:j+3] == `"""` || trimmed[j:j+3] == `'''`) {
+					tripleDelim = trimmed[j : j+3]
+					if j == docOffset {
+						tripleMode = 1
+						enteredDocstringThisLine = true
+					} else {
+						tripleMode = 2
+						hasNonDocCodeThisLine = true
+					}
+					j += 3
+					continue
+				}
+				if c == '"' || c == '\'' {
+					hasNonDocCodeThisLine = true
+					singleQuote = c
+					j++
+					continue
+				}
+				switch c {
+				case '(', '[', '{':
+					parenDepth++
+					hasNonDocCodeThisLine = true
+				case ')', ']', '}':
+					if parenDepth > 0 {
+						parenDepth--
+					}
+					hasNonDocCodeThisLine = true
+				case ' ', '\t', '\r':
+				default:
+					if docOffset < 0 || j >= docOffset {
+						hasNonDocCodeThisLine = true
+					}
+				}
+				j++
+			}
+
+			if (tripleMode == 1 || enteredDocstringThisLine || closedDocstringThisLine) && !hasNonDocCodeThisLine {
+				mask[i] = true
+				if tripleMode == 0 {
+					prevSignificantEnd = ""
+				}
+				continue
+			}
+
+			if tripleMode == 0 && codeEnd > 0 {
+				codeSlice := strings.TrimSpace(trimmed[:codeEnd])
+				if codeSlice != "" {
+					prevSignificantEnd = codeSlice
+				}
+			}
+		}
+		return mask
+	}
+
+	if isRuby {
+		inPod := false
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				mask[i] = true
+				continue
+			}
+			if strings.HasPrefix(line, "=begin") {
+				inPod = true
+				mask[i] = true
+				continue
+			}
+			if inPod {
+				mask[i] = true
+				if strings.HasPrefix(line, "=end") {
+					inPod = false
+				}
+			}
+		}
+		return mask
+	}
+
+	// C / JS / TS / Go / Rust comment & block comment masking (quote-aware).
+	inBlock := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			mask[i] = true
+			continue
+		}
+		hasCode := false
+		var inQuote byte
+		for j := 0; j < len(line); j++ {
+			c := line[j]
+			if inBlock {
+				if c == '*' && j+1 < len(line) && line[j+1] == '/' {
+					inBlock = false
+					j++
+				}
+				continue
+			}
+			if inQuote != 0 {
+				hasCode = true
+				if c == '\\' && (!isGo || inQuote != '`') && j+1 < len(line) {
+					j++
+					continue
+				}
+				if c == inQuote {
+					inQuote = 0
+				}
+				continue
+			}
+			if c == ' ' || c == '\t' || c == '\r' {
+				continue
+			}
+			if c == '/' && j+1 < len(line) {
+				if line[j+1] == '/' {
+					break
+				}
+				if line[j+1] == '*' {
+					inBlock = true
+					j++
+					continue
+				}
+			}
+			hasCode = true
+			if c == '"' || c == '\'' || c == '`' {
+				inQuote = c
+			}
+		}
+		if !hasCode {
+			mask[i] = true
+		}
+	}
+	return mask
 }
 
 func isPlaceholderExampleHostOrLine(host, lineLower string) bool {
@@ -584,6 +976,31 @@ func isPlaceholderExampleHostOrLine(host, lineLower string) bool {
 	return false
 }
 
+// buildJoinedCodeSnippet reconstructs split adjacent string literals across up to maxLookahead unmasked lines.
+func buildJoinedCodeSnippet(lines []string, nonCodeMask []bool, idx, maxLookahead int) string {
+	var b strings.Builder
+	b.WriteString(lines[idx])
+	limit := idx + maxLookahead
+	if limit > len(lines) {
+		limit = len(lines)
+	}
+	for j := idx + 1; j < limit; j++ {
+		if j < len(nonCodeMask) && nonCodeMask[j] {
+			break
+		}
+		tr := strings.TrimSpace(lines[j])
+		if tr == "" {
+			break
+		}
+		b.WriteByte('\n')
+		b.WriteString(lines[j])
+		if tr == ")" || strings.HasSuffix(tr, ";") {
+			break
+		}
+	}
+	return adjacentStringConcatRe.ReplaceAllString(b.String(), "")
+}
+
 // AnalyzeBehavioralPatterns scans non-test runtime source files for generalizable air-gap
 // download anti-patterns (returned in findings) and non-download resilience warnings such
 // as HTTP client calls omitting timeout= (returned separately in hints).
@@ -591,76 +1008,116 @@ func AnalyzeBehavioralPatterns(relSlash, content string, seen map[string]bool) (
 	var findings []CheckRiskFinding
 	var hints []CheckRiskFinding
 	hosts := make(map[string]string)
-	if isBehavioralNoisePath(relSlash) {
+	lowerPath := strings.ToLower(relSlash)
+	lowerBase := strings.ToLower(filepath.Base(relSlash))
+	if IsNonRuntimeSourcePath(relSlash, lowerBase) {
 		return findings, hints, hosts
 	}
 
-	lowerPath := strings.ToLower(relSlash)
+	lines := strings.Split(content, "\n")
 	isPythonFile := strings.HasSuffix(lowerPath, ".py")
-	hasHTTPFetchInFile := (strings.Contains(content, "urllib") ||
-		strings.Contains(content, "requests.") ||
-		strings.Contains(content, "httpx.") ||
-		strings.Contains(content, "aiohttp.") ||
-		strings.Contains(content, "fetch(") ||
-		strings.Contains(content, "axios.") ||
-		strings.Contains(content, "http.Get(")) && httpFetchHintRe.MatchString(content)
+	nonCodeMask := BuildNonCodeLineMask(content, lowerBase)
+	hasHTTPFetchInFile := FileHasHTTPClient(content) && HasActiveHTTPClient(lines, nonCodeMask)
 
 	// Fast file-level pre-filters avoid per-line regex sweeps across thousands of files.
-	checkAssetURL := (strings.Contains(content, "http://") || strings.Contains(content, "https://")) && assetExtOrHintRe.MatchString(content)
+	hasHTTPProtocol := strings.Contains(content, "http://") || strings.Contains(content, "https://")
+	checkAssetURL := hasHTTPProtocol && (assetExtOrHintRe.MatchString(content) || strings.Contains(content, "\"\n") || strings.Contains(content, "'\n"))
+	checkRuntimeMetaURL := hasHTTPProtocol && runtimeMetaOrUpdateURLRe.MatchString(content)
 	checkUrlRetrieve := (strings.Contains(content, "urlretrieve") || strings.Contains(content, "wget.download")) && urlRetrieveRe.MatchString(content)
 	checkUnpack := hasHTTPFetchInFile && (strings.Contains(content, "unpack_archive") || strings.Contains(content, "tarfile.open") || strings.Contains(content, "ZipFile")) && archiveUnpackRe.MatchString(content)
-	checkSubproc := (strings.Contains(content, "subprocess") || strings.Contains(content, "os.system") || strings.Contains(content, "execSync") || strings.Contains(content, "child_process") || strings.Contains(content, "exec.Command")) && subprocessNetRe.MatchString(content)
+	checkSubproc := (strings.Contains(content, "subprocess") || strings.Contains(content, "os.system") || strings.Contains(content, "execSync") || strings.Contains(content, "child_process") || strings.Contains(content, "exec.Command")) && (subprocessStartRe.MatchString(content) || subprocessNetRe.MatchString(content))
 	checkPyTimeout := isPythonFile && (strings.Contains(content, "requests.") || strings.Contains(content, "urllib.request.urlopen")) && pyReqNoTimeoutRe.MatchString(content)
 
-	if checkAssetURL || checkUrlRetrieve || checkUnpack || checkSubproc || checkPyTimeout {
-		lines := strings.Split(content, "\n")
+	if checkAssetURL || checkRuntimeMetaURL || checkUrlRetrieve || checkUnpack || checkSubproc || checkPyTimeout {
 		noTimeoutCount := 0
 		noTimeoutFirstLine := 0
 		foundSubproc := false
-		foundAssetURL := false
 		foundArchiveFetch := false
 
 		for idx, rawLine := range lines {
 			lineNo := idx + 1
+			if nonCodeMask[idx] {
+				continue
+			}
 			trimmed := strings.TrimSpace(rawLine)
 			if trimmed == "" || isCommentLine(trimmed) {
 				continue
 			}
 
-			// 1. Unknown external URLs serving model weights, price maps, or binary archives
-			if checkAssetURL && !foundAssetURL && (strings.Contains(trimmed, "http://") || strings.Contains(trimmed, "https://")) && assetExtOrHintRe.MatchString(trimmed) {
-				lowerLine := strings.ToLower(trimmed)
-				matches := httpsURLRegex.FindAllStringSubmatch(trimmed, -1)
-				for _, m := range matches {
-					if len(m) < 2 {
-						continue
+			// 1. Unknown external URLs serving model weights, price maps, or binary archives (including adjacent split literals)
+			if checkAssetURL && (strings.Contains(trimmed, "http://") || strings.Contains(trimmed, "https://")) {
+				effectiveLine := trimmed
+				if !assetExtOrHintRe.MatchString(effectiveLine) {
+					effectiveLine = buildJoinedCodeSnippet(lines, nonCodeMask, idx, 6)
+				}
+				if assetExtOrHintRe.MatchString(effectiveLine) && !IsHashVerificationLine(effectiveLine, content, hasHTTPFetchInFile) {
+					lowerLine := strings.ToLower(effectiveLine)
+					matches := httpsURLRegex.FindAllStringSubmatch(effectiveLine, -1)
+					for _, m := range matches {
+						if len(m) < 2 {
+							continue
+						}
+						parsed, err := url.Parse(m[0])
+						if err != nil || parsed.Hostname() == "" {
+							continue
+						}
+						h := strings.ToLower(parsed.Hostname())
+						if (isIgnoredLocalOrDocHost(h) && h != "raw.githubusercontent.com") || isPlaceholderExampleHostOrLine(h, lowerLine) {
+							continue
+						}
+						key := "behavioral_asset_url|" + h + "|" + relSlash
+						if !seen[key] {
+							seen[key] = true
+							hosts[h] = "behavioral_code"
+							cleanDisplayURL := strings.SplitN(m[0], "?", 2)[0]
+							findings = append(findings, CheckRiskFinding{
+								Category:         "behavioral_asset_download",
+								Severity:         "HIGH",
+								Component:        fmt.Sprintf("runtime asset/model URL (%s)", h),
+								SourceFile:       fmt.Sprintf("%s:%d", relSlash, lineNo),
+								DependencyScope:  "behavioral_heuristic",
+								ExecutionContext: "server_runtime",
+								EgressHosts:      []string{h},
+								FailureImpact:    fmt.Sprintf("References remote model/archive/config URL (%s) in runtime code; fails or stalls if not pre-baked or disabled via env.", cleanDisplayURL),
+								Mitigation:       "Pre-download the remote asset at Docker build time or configure an offline local path/env toggle.",
+							})
+							break
+						}
 					}
-					parsed, err := url.Parse(m[0])
+				}
+			}
+
+			// 1b. Runtime update, release, PyPI version check, or pricing metadata endpoints
+			if checkRuntimeMetaURL && (strings.Contains(trimmed, "http://") || strings.Contains(trimmed, "https://")) {
+				for _, m := range runtimeMetaOrUpdateURLRe.FindAllString(trimmed, -1) {
+					parsed, err := url.Parse(m)
 					if err != nil || parsed.Hostname() == "" {
 						continue
 					}
 					h := strings.ToLower(parsed.Hostname())
-					if (isIgnoredLocalOrDocHost(h) && h != "raw.githubusercontent.com") || isPlaceholderExampleHostOrLine(h, lowerLine) {
+					lowerLine := strings.ToLower(trimmed)
+					if isPlaceholderExampleHostOrLine(h, lowerLine) {
 						continue
 					}
-					key := "behavioral_asset_url|" + h + "|" + relSlash
+					if h == "localhost" || h == "127.0.0.1" || h == "0.0.0.0" || strings.HasSuffix(h, ".test") || strings.HasSuffix(h, ".example") || strings.HasSuffix(h, ".invalid") || strings.HasSuffix(h, ".localhost") {
+						continue
+					}
+					key := "behavioral_runtime_api|" + h + "|" + relSlash
 					if !seen[key] {
 						seen[key] = true
-						foundAssetURL = true
 						hosts[h] = "behavioral_code"
-						cleanDisplayURL := strings.SplitN(m[0], "?", 2)[0]
+						cleanDisplayURL := strings.SplitN(m, "?", 2)[0]
 						findings = append(findings, CheckRiskFinding{
-							Category:         "behavioral_asset_download",
-							Severity:         "HIGH",
-							Component:        fmt.Sprintf("runtime asset/model URL (%s)", h),
+							Category:         "behavioral_runtime_api_check",
+							Severity:         "MEDIUM",
+							Component:        fmt.Sprintf("runtime update/pricing API check (%s)", h),
 							SourceFile:       fmt.Sprintf("%s:%d", relSlash, lineNo),
 							DependencyScope:  "behavioral_heuristic",
 							ExecutionContext: "server_runtime",
 							EgressHosts:      []string{h},
-							FailureImpact:    fmt.Sprintf("References remote model/archive/config URL (%s) in runtime code; fails or stalls if not pre-baked or disabled via env.", cleanDisplayURL),
-							Mitigation:       "Pre-download the remote asset at Docker build time or configure an offline local path/env toggle.",
+							FailureImpact:    fmt.Sprintf("Queries external metadata/update/pricing API (%s) at runtime; fails or hangs when internet egress is blocked.", cleanDisplayURL),
+							Mitigation:       "Disable online version/pricing lookups via config/ENV or cache the JSON metadata locally in the image.",
 						})
-						break
 					}
 				}
 			}
@@ -701,22 +1158,50 @@ func AnalyzeBehavioralPatterns(relSlash, content string, seen map[string]bool) (
 				}
 			}
 
-			// 3. Subprocess runtime installers (pip install, playwright install, curl, wget, git clone)
-			if checkSubproc && !foundSubproc && subprocessNetRe.MatchString(trimmed) {
-				key := "behavioral_subprocess|" + relSlash
-				if !seen[key] {
-					seen[key] = true
-					foundSubproc = true
-					findings = append(findings, CheckRiskFinding{
-						Category:         "behavioral_subprocess_download",
-						Severity:         "CRITICAL",
-						Component:        "runtime subprocess downloader/installer",
-						SourceFile:       fmt.Sprintf("%s:%d", relSlash, lineNo),
-						DependencyScope:  "behavioral_heuristic",
-						ExecutionContext: "server_runtime",
-						FailureImpact:    "Executes external package manager / curl / wget / git clone at runtime; guaranteed failure without egress network.",
-						Mitigation:       "Perform all dependency, binary, and repository installation during Docker image build.",
-					})
+			// 3. Subprocess runtime installers (single-line and multi-line lists up to 800 chars)
+			if checkSubproc && !foundSubproc {
+				matchedSubproc := subprocessNetRe.MatchString(trimmed)
+				if !matchedSubproc {
+					if loc := subprocessStartRe.FindStringIndex(trimmed); loc != nil {
+						var wb strings.Builder
+						wb.WriteString(trimmed[loc[0]:])
+						endIdx := idx + 16
+						if endIdx > len(lines) {
+							endIdx = len(lines)
+						}
+						for j := idx + 1; j < endIdx && wb.Len() < 800; j++ {
+							if nonCodeMask[j] {
+								continue
+							}
+							wb.WriteByte('\n')
+							wb.WriteString(lines[j])
+						}
+						wStr := wb.String()
+						if len(wStr) > 800 {
+							wStr = wStr[:800]
+						}
+						callSnippet := sliceUntilBalancedParen(wStr)
+						if subprocessNetActionRe.MatchString(callSnippet) {
+							matchedSubproc = true
+						}
+					}
+				}
+				if matchedSubproc {
+					key := "behavioral_subprocess|" + relSlash
+					if !seen[key] {
+						seen[key] = true
+						foundSubproc = true
+						findings = append(findings, CheckRiskFinding{
+							Category:         "behavioral_subprocess_download",
+							Severity:         "CRITICAL",
+							Component:        "runtime subprocess downloader/installer",
+							SourceFile:       fmt.Sprintf("%s:%d", relSlash, lineNo),
+							DependencyScope:  "behavioral_heuristic",
+							ExecutionContext: "server_runtime",
+							FailureImpact:    "Executes external package manager / curl / wget / git clone at runtime; guaranteed failure without egress network.",
+							Mitigation:       "Perform all dependency, binary, and repository installation during Docker image build.",
+						})
+					}
 				}
 			}
 
@@ -729,6 +1214,9 @@ func AnalyzeBehavioralPatterns(relSlash, content string, seen map[string]bool) (
 					}
 					window := trimmed[loc[0]:]
 					for j := idx + 1; j < endIdx; j++ {
+						if nonCodeMask[j] {
+							continue
+						}
 						window += "\n" + lines[j]
 					}
 					callSnippet, closed := sliceUntilBalancedParenStatus(window)
@@ -779,6 +1267,121 @@ func AnalyzeBehavioralPatterns(relSlash, content string, seen map[string]bool) (
 	}
 
 	return findings, hints, hosts
+}
+
+var (
+	uiTelemetryPlaceholderLineRe = regexp.MustCompile(`(?i)(?:\bplaceholder\s*[:={]|\b(?:doc_?url|docs_?url|help_?url)\s*[:=]|\bhref\s*[:=]|<a\s[^>]*href|\bwindow\.open\s*\()`)
+	uiTelemetryPrevLineLinkRe    = regexp.MustCompile(`(?i)(?:\bwindow\.open\s*\([^;\)]*$|href\s*[:=]\s*\{?\s*$)`)
+)
+
+func isUITelemetryPlaceholderOrLink(relSlash, lowerContent, lineLower string, lines []string, idx int) bool {
+	lowerRel := strings.ToLower(relSlash)
+	if strings.HasSuffix(lowerRel, ".credential.ts") || strings.HasSuffix(lowerRel, ".credential.js") || strings.Contains(lowerContent, "implements inodecredential") {
+		return true
+	}
+	if uiTelemetryPlaceholderLineRe.MatchString(lineLower) {
+		return true
+	}
+	for back := 1; back <= 2 && idx-back >= 0; back++ {
+		prev := strings.TrimSpace(strings.ToLower(lines[idx-back]))
+		if prev == "" || isCommentLine(prev) {
+			continue
+		}
+		if uiTelemetryPrevLineLinkRe.MatchString(prev) {
+			return true
+		}
+		break
+	}
+	return false
+}
+
+// AnalyzeSourceTelemetryURLs detects direct outbound telemetry/OTLP/tracing URL literals in non-comment
+// runtime source files (catching custom stdlib/urllib telemetry senders such as browser-use PostHog,
+// dify OTLP endpoints, and openai-agents tracing ingest even when no third-party telemetry SDK is listed).
+func AnalyzeSourceTelemetryURLs(relSlash, content string, nonCodeMask []bool, isBrowser bool, seen map[string]bool) ([]CheckRiskFinding, map[string]string) {
+	var findings []CheckRiskFinding
+	hosts := make(map[string]string)
+	if (!strings.Contains(content, "http://") && !strings.Contains(content, "https://")) || !sourceTelemetryURLRe.MatchString(content) {
+		return findings, hosts
+	}
+	lowerContent := strings.ToLower(content)
+	if strings.HasSuffix(strings.ToLower(relSlash), ".credential.ts") || strings.HasSuffix(strings.ToLower(relSlash), ".credential.js") || strings.Contains(lowerContent, "implements inodecredential") {
+		return findings, hosts
+	}
+	lines := strings.Split(content, "\n")
+	hasHTTPFetchInFile := FileHasHTTPClient(content) && HasActiveHTTPClient(lines, nonCodeMask)
+	for idx, rawLine := range lines {
+		if idx < len(nonCodeMask) && nonCodeMask[idx] {
+			continue
+		}
+		trimmed := strings.TrimSpace(rawLine)
+		if trimmed == "" || isCommentLine(trimmed) || (!strings.Contains(trimmed, "http://") && !strings.Contains(trimmed, "https://")) {
+			continue
+		}
+		if IsHashVerificationLine(trimmed, content, hasHTTPFetchInFile) {
+			continue
+		}
+		lineLower := strings.ToLower(trimmed)
+		if isUITelemetryPlaceholderOrLink(relSlash, lowerContent, lineLower, lines, idx) {
+			continue
+		}
+		for _, m := range sourceTelemetryURLRe.FindAllString(trimmed, -1) {
+			parsed, err := url.Parse(m)
+			if err != nil || parsed.Hostname() == "" {
+				continue
+			}
+			h := strings.ToLower(parsed.Hostname())
+			if isPlaceholderExampleHostOrLine(h, lineLower) {
+				continue
+			}
+			key := "source_tel|" + h + "|" + relSlash
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			hosts[h] = "static_code"
+			execCtx := "server_runtime"
+			autoSealed := false
+			comp := fmt.Sprintf("telemetry endpoint (%s)", h)
+			impact := fmt.Sprintf("Runtime source references outbound telemetry endpoint %s.", strings.SplitN(m, "?", 2)[0])
+			mitigation := "Disable telemetry via runtime config/ENV or block the host at the egress proxy."
+
+			switch {
+			case strings.Contains(m, "/v1/traces/ingest"):
+				comp = "openai-agents tracing ingest (/v1/traces/ingest)"
+				autoSealed = true
+				mitigation = "Set OPENAI_AGENTS_DISABLE_TRACING=1 in container ENV or disable tracing in code."
+			case strings.Contains(h, "posthog.com"):
+				if strings.Contains(lowerContent, "anonymized_telemetry") {
+					autoSealed = true
+				}
+			case strings.HasPrefix(h, "otel.") || strings.Contains(h, ".otel."):
+				if strings.Contains(lowerContent, "otel_") || strings.Contains(lowerContent, "telemetry") {
+					autoSealed = true
+				}
+			}
+			if isBrowser {
+				execCtx = "browser_client"
+				autoSealed = false
+				impact = fmt.Sprintf("Client-side source in %s sends telemetry from the end-user's browser to %s.", relSlash, h)
+				mitigation = "Server environment variables do NOT disable browser SDKs; gate SDK initialization in frontend source code."
+			}
+
+			findings = append(findings, CheckRiskFinding{
+				Category:         "telemetry_analytics",
+				Severity:         "MEDIUM",
+				Component:        comp,
+				SourceFile:       fmt.Sprintf("%s:%d", relSlash, idx+1),
+				DependencyScope:  "source_call",
+				ExecutionContext: execCtx,
+				EgressHosts:      []string{h},
+				FailureImpact:    impact,
+				Mitigation:       mitigation,
+				AutoSealedByEnv:  autoSealed,
+			})
+		}
+	}
+	return findings, hosts
 }
 
 func sliceUntilBalancedParenStatus(s string) (string, bool) {

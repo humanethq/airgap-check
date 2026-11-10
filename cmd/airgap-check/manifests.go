@@ -70,6 +70,20 @@ func ExtractDepNameAndExtras(spec string, format string) (string, []string) {
 		s = s[:idx]
 	} else if idx := strings.Index(s, "@"); idx > 0 && !strings.HasPrefix(s, "@") {
 		s = s[:idx]
+	} else if format == "python" && (strings.Contains(s, "://") || strings.HasSuffix(strings.ToLower(strings.TrimSpace(s)), ".whl")) {
+		base := s
+		if sl := strings.LastIndex(base, "/"); sl >= 0 {
+			base = base[sl+1:]
+		}
+		if q := strings.IndexAny(base, "?#"); q >= 0 {
+			base = base[:q]
+		}
+		// Extract distribution name from wheel filename like `en_core_web_sm-3.8.0-py3-none-any.whl`
+		if strings.HasSuffix(strings.ToLower(base), ".whl") {
+			if dash := strings.Index(base, "-"); dash > 0 {
+				s = base[:dash]
+			}
+		}
 	}
 
 	var extras []string
@@ -109,6 +123,7 @@ func isDevOrNonRuntimeGroupName(group string) bool {
 		"lint": true, "linting": true, "format": true, "formatting": true,
 		"typing": true, "typecheck": true, "type-check": true, "typechecking": true,
 		"docs": true, "doc": true, "documentation": true,
+		"doc-dev": true, "docs-dev": true, "doc-build": true, "docs-build": true, "docs-api": true, "mkdocs": true, "sphinx": true,
 		"ci": true, "coverage": true, "cov": true, "e2e": true, "e2e-dev": true,
 		"benchmark": true, "benchmarks": true, "bench": true,
 		"examples": true, "example": true, "constraints": true,
@@ -119,7 +134,7 @@ func isDevOrNonRuntimeGroupName(group string) bool {
 	if exactIgnored[g] {
 		return true
 	}
-	for _, prefix := range []string{"dev-", "test-", "lint-", "doc-", "docs-", "ci-", "e2e-"} {
+	for _, prefix := range []string{"dev-", "test-", "lint-", "ci-", "e2e-"} {
 		if strings.HasPrefix(g, prefix) {
 			return true
 		}
@@ -235,6 +250,11 @@ func parsePyprojectTOML(rawBytes []byte) ([]ManifestDep, map[string][]string) {
 	requestedExtras := make(map[string][]string)
 	seen := make(map[string]bool)
 
+	var uvDefaultGroups []string
+	uvDefaultGroupsAll := false
+	depGroups := make(map[string][]string)
+	depGroupIncludes := make(map[string][]string)
+
 	addDep := func(spec, scope, extra string) {
 		name, exList := ExtractDepNameAndExtras(spec, "python")
 		if name == "" || name == "python" {
@@ -268,6 +288,25 @@ func parsePyprojectTOML(rawBytes []byte) ([]ManifestDep, map[string][]string) {
 			for _, item := range parseTOMLStringArray(kv.rawVal) {
 				addDep(item, "prod", "")
 			}
+		case sec == "tool.uv" && (keyLower == "default-groups" || keyLower == "default_groups"):
+			valClean := strings.Trim(strings.ToLower(strings.TrimSpace(kv.rawVal)), `"'`)
+			if valClean == "all" {
+				uvDefaultGroupsAll = true
+			} else {
+				for _, g := range parseTOMLStringArray(kv.rawVal) {
+					gn := strings.ToLower(strings.TrimSpace(g))
+					if gn != "" {
+						uvDefaultGroups = append(uvDefaultGroups, gn)
+					}
+				}
+			}
+		case sec == "dependency-groups":
+			depGroups[keyLower] = append(depGroups[keyLower], parseTOMLStringArray(kv.rawVal)...)
+			for _, tbl := range parseTOMLInlineTables(kv.rawVal) {
+				if inc := strings.ToLower(strings.TrimSpace(tbl["include-group"])); inc != "" {
+					depGroupIncludes[keyLower] = append(depGroupIncludes[keyLower], inc)
+				}
+			}
 		case sec == "tool.poetry.dependencies":
 			pkg := NormalizePackageName(keyLower, "python")
 			if pkg == "" || pkg == "python" {
@@ -289,13 +328,120 @@ func parsePyprojectTOML(rawBytes []byte) ([]ManifestDep, map[string][]string) {
 				addDep(item, "optional_extra", keyLower)
 			}
 		default:
-			// Explicitly ignore [dependency-groups], [tool.poetry.group.*], [tool.poetry.dev-dependencies],
-			// [tool.uv*], [tool.ruff*], [tool.mypy*], [tool.pyright*], [tool.ty*], [tool.pytest*],
-			// [tool.hatch.envs*], [build-system], etc.
+			// Ignore non-default [dependency-groups], [tool.poetry.group.*], lint/type/test sections, etc.
 			continue
 		}
 	}
+
+	if uvDefaultGroupsAll {
+		for g := range depGroups {
+			if !isDevOrNonRuntimeGroupName(g) {
+				uvDefaultGroups = append(uvDefaultGroups, g)
+			}
+		}
+		sort.Strings(uvDefaultGroups)
+	}
+	if len(uvDefaultGroups) > 0 && len(depGroups) > 0 {
+		visitedGroup := make(map[string]bool)
+		queue := append([]string(nil), uvDefaultGroups...)
+		for len(queue) > 0 {
+			g := queue[0]
+			queue = queue[1:]
+			if visitedGroup[g] || isDevOrNonRuntimeGroupName(g) {
+				continue
+			}
+			visitedGroup[g] = true
+			for _, item := range depGroups[g] {
+				addDep(item, "prod", "")
+			}
+			for _, inc := range depGroupIncludes[g] {
+				if !visitedGroup[inc] && !isDevOrNonRuntimeGroupName(inc) {
+					queue = append(queue, inc)
+				}
+			}
+		}
+	}
+
 	return out, requestedExtras
+}
+
+// ParsePyprojectDynamicFileRefs extracts file paths referenced under
+// `[tool.setuptools.dynamic]` (`dependencies`) and `[tool.setuptools.dynamic.optional-dependencies]`.
+func ParsePyprojectDynamicFileRefs(rawBytes []byte) ([]string, map[string][]string) {
+	kvs := scanTOMLKeyValues(string(rawBytes))
+	var prodFiles []string
+	extraFiles := make(map[string][]string)
+
+	extractFiles := func(rawVal string) []string {
+		s := strings.TrimSpace(rawVal)
+		if s == "" {
+			return nil
+		}
+		var fileVals []string
+		if strings.HasPrefix(s, "{") {
+			tbl := parseTOMLSingleInlineTable(s)
+			if fv, ok := tbl["file"]; ok {
+				if strings.HasPrefix(strings.TrimSpace(fv), "[") {
+					fileVals = parseTOMLStringArray(fv)
+				} else if cleaned := strings.Trim(strings.TrimSpace(fv), `"'`); cleaned != "" {
+					fileVals = []string{cleaned}
+				}
+			}
+		} else if strings.HasPrefix(s, "[") {
+			fileVals = parseTOMLStringArray(s)
+		} else {
+			if cleaned := strings.Trim(s, `"'`); cleaned != "" {
+				fileVals = []string{cleaned}
+			}
+		}
+		var cleanedOut []string
+		for _, f := range fileVals {
+			cf := filepath.ToSlash(filepath.Clean(strings.TrimSpace(f)))
+			if cf != "" && cf != "." {
+				cleanedOut = append(cleanedOut, cf)
+			}
+		}
+		return cleanedOut
+	}
+
+	for _, kv := range kvs {
+		sec := strings.ToLower(strings.TrimSpace(kv.section))
+		keyLower := strings.ToLower(strings.TrimSpace(kv.key))
+		switch sec {
+		case "tool.setuptools.dynamic":
+			if keyLower == "dependencies" {
+				prodFiles = append(prodFiles, extractFiles(kv.rawVal)...)
+			}
+		case "tool.setuptools.dynamic.optional-dependencies":
+			files := extractFiles(kv.rawVal)
+			if len(files) > 0 {
+				extraFiles[keyLower] = append(extraFiles[keyLower], files...)
+			}
+		}
+	}
+	return prodFiles, extraFiles
+}
+
+func parseTOMLSingleInlineTable(s string) map[string]string {
+	out := make(map[string]string)
+	trimmed := strings.TrimSpace(s)
+	if !strings.HasPrefix(trimmed, "{") || !strings.HasSuffix(trimmed, "}") {
+		return out
+	}
+	inner := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+	for _, field := range splitTopLevelCommas(inner) {
+		eq := strings.Index(field, "=")
+		if eq <= 0 {
+			continue
+		}
+		k := strings.ToLower(strings.TrimSpace(field[:eq]))
+		v := strings.TrimSpace(field[eq+1:])
+		if !strings.HasPrefix(v, "[") && !strings.HasPrefix(v, "{") {
+			v = strings.Trim(v, `"'`)
+		}
+		out[k] = v
+	}
+	return out
 }
 
 func parsePipfileTOML(rawBytes []byte) []ManifestDep {
@@ -455,7 +601,7 @@ type uvLockPkg struct {
 	isEditable bool
 }
 
-func parseUVLockBFS(rawBytes []byte, prodRoots []ManifestDep) []ManifestDep {
+func parseUVLockBFS(rawBytes []byte, manifestDeps []ManifestDep) []ManifestDep {
 	kvs := scanTOMLKeyValues(string(rawBytes))
 	var pkgs []*uvLockPkg
 	byName := make(map[string][]*uvLockPkg)
@@ -521,20 +667,21 @@ func parseUVLockBFS(rawBytes []byte, prodRoots []ManifestDep) []ManifestDep {
 		}
 	}
 
-	// Start BFS from editable/virtual workspace packages (excluding examples/tests/benchmarks members)
 	type qNode struct {
-		name  string
-		extra string
-		via   string
+		name       string
+		extra      string
+		via        string
+		extraLabel string
 	}
-	var queue []qNode
+	var prodQueue []qNode
+	var optQueue []qNode
 	isWorkspaceRoot := make(map[string]bool)
+	var optExtraNames []string
 
 	for _, p := range pkgs {
 		if !p.isEditable || p.name == "" {
 			continue
 		}
-		// Skip example / test / eval / docs workspace packages unless they are root "."
 		srcLower := p.sourceRaw
 		if !strings.Contains(srcLower, `"."`) && !strings.Contains(srcLower, `'.'`) {
 			isNonProdMember := false
@@ -549,30 +696,32 @@ func parseUVLockBFS(rawBytes []byte, prodRoots []ManifestDep) []ManifestDep {
 			}
 		}
 		isWorkspaceRoot[p.name] = true
-		queue = append(queue, qNode{name: p.name, via: p.name})
+		prodQueue = append(prodQueue, qNode{name: p.name, via: p.name})
+		for exName := range p.optDeps {
+			optExtraNames = append(optExtraNames, exName)
+		}
 	}
-	if len(queue) == 0 && len(prodRoots) > 0 {
-		for _, pr := range prodRoots {
+	if len(prodQueue) == 0 && len(manifestDeps) > 0 {
+		for _, pr := range manifestDeps {
 			if pr.Format == "python" && pr.Scope == "prod" {
-				queue = append(queue, qNode{name: pr.Name, via: pr.Name})
+				prodQueue = append(prodQueue, qNode{name: pr.Name, via: pr.Name})
 			}
 		}
 	}
 
-	visitedNode := make(map[string]bool)
-	discovered := make(map[string]string) // pkg -> via
-
-	for len(queue) > 0 {
-		curN := queue[0]
-		queue = queue[1:]
+	visitedProd := make(map[string]bool)
+	discoveredProd := make(map[string]string) // pkg -> via
+	for len(prodQueue) > 0 {
+		curN := prodQueue[0]
+		prodQueue = prodQueue[1:]
 		visitKey := curN.name + "|" + curN.extra
-		if visitedNode[visitKey] {
+		if visitedProd[visitKey] {
 			continue
 		}
-		visitedNode[visitKey] = true
+		visitedProd[visitKey] = true
 		if !isWorkspaceRoot[curN.name] {
-			if _, exists := discovered[curN.name]; !exists {
-				discovered[curN.name] = curN.via
+			if _, exists := discoveredProd[curN.name]; !exists {
+				discoveredProd[curN.name] = curN.via
 			}
 		}
 		for _, p := range byName[curN.name] {
@@ -582,16 +731,88 @@ func parseUVLockBFS(rawBytes []byte, prodRoots []ManifestDep) []ManifestDep {
 					if via == "" {
 						via = curN.name
 					}
-					queue = append(queue, qNode{name: ed.name, extra: "", via: via})
+					prodQueue = append(prodQueue, qNode{name: ed.name, extra: "", via: via})
 					for _, reqEx := range ed.extras {
-						queue = append(queue, qNode{name: ed.name, extra: reqEx, via: via})
+						prodQueue = append(prodQueue, qNode{name: ed.name, extra: reqEx, via: via})
 					}
 				}
 			} else {
 				for _, ed := range p.optDeps[curN.extra] {
-					queue = append(queue, qNode{name: ed.name, extra: "", via: curN.name + "[" + curN.extra + "]"})
+					prodQueue = append(prodQueue, qNode{name: ed.name, extra: "", via: curN.name + "[" + curN.extra + "]"})
 					for _, reqEx := range ed.extras {
-						queue = append(queue, qNode{name: ed.name, extra: reqEx, via: curN.name + "[" + curN.extra + "]"})
+						prodQueue = append(prodQueue, qNode{name: ed.name, extra: reqEx, via: curN.name + "[" + curN.extra + "]"})
+					}
+				}
+			}
+		}
+	}
+
+	sort.Slice(optExtraNames, func(i, j int) bool {
+		if optExtraNames[i] == "all" && optExtraNames[j] != "all" {
+			return false
+		}
+		if optExtraNames[i] != "all" && optExtraNames[j] == "all" {
+			return true
+		}
+		return optExtraNames[i] < optExtraNames[j]
+	})
+	for _, pr := range manifestDeps {
+		if pr.Format == "python" && pr.Scope == "optional_extra" && !isDevOrNonRuntimeGroupName(pr.Extra) {
+			viaLabel := pr.Name
+			if pr.Extra != "" {
+				viaLabel = pr.Name + " [extra: " + pr.Extra + "]"
+			}
+			optQueue = append(optQueue, qNode{name: pr.Name, extra: "", via: viaLabel, extraLabel: pr.Extra})
+		}
+	}
+	for _, p := range pkgs {
+		if !isWorkspaceRoot[p.name] {
+			continue
+		}
+		for _, exName := range optExtraNames {
+			for _, ed := range p.optDeps[exName] {
+				optQueue = append(optQueue, qNode{name: ed.name, extra: "", via: p.name + "[" + exName + "]", extraLabel: exName})
+				for _, reqEx := range ed.extras {
+					optQueue = append(optQueue, qNode{name: ed.name, extra: reqEx, via: p.name + "[" + exName + "]", extraLabel: exName})
+				}
+			}
+		}
+	}
+
+	type optDiscovery struct {
+		via   string
+		extra string
+	}
+	visitedOpt := make(map[string]bool)
+	discoveredOpt := make(map[string]optDiscovery)
+	for len(optQueue) > 0 {
+		curN := optQueue[0]
+		optQueue = optQueue[1:]
+		visitKey := curN.name + "|" + curN.extra
+		if visitedOpt[visitKey] {
+			continue
+		}
+		visitedOpt[visitKey] = true
+		if !isWorkspaceRoot[curN.name] {
+			if _, inProd := discoveredProd[curN.name]; !inProd {
+				if _, exists := discoveredOpt[curN.name]; !exists {
+					discoveredOpt[curN.name] = optDiscovery{via: curN.via, extra: curN.extraLabel}
+				}
+			}
+		}
+		for _, p := range byName[curN.name] {
+			if curN.extra == "" {
+				for _, ed := range p.deps {
+					optQueue = append(optQueue, qNode{name: ed.name, extra: "", via: curN.via, extraLabel: curN.extraLabel})
+					for _, reqEx := range ed.extras {
+						optQueue = append(optQueue, qNode{name: ed.name, extra: reqEx, via: curN.via, extraLabel: curN.extraLabel})
+					}
+				}
+			} else {
+				for _, ed := range p.optDeps[curN.extra] {
+					optQueue = append(optQueue, qNode{name: ed.name, extra: "", via: curN.via, extraLabel: curN.extraLabel})
+					for _, reqEx := range ed.extras {
+						optQueue = append(optQueue, qNode{name: ed.name, extra: reqEx, via: curN.via, extraLabel: curN.extraLabel})
 					}
 				}
 			}
@@ -599,7 +820,7 @@ func parseUVLockBFS(rawBytes []byte, prodRoots []ManifestDep) []ManifestDep {
 	}
 
 	var out []ManifestDep
-	for pkg, via := range discovered {
+	for pkg, via := range discoveredProd {
 		out = append(out, ManifestDep{
 			Name:   pkg,
 			Scope:  "transitive_lockfile",
@@ -607,11 +828,25 @@ func parseUVLockBFS(rawBytes []byte, prodRoots []ManifestDep) []ManifestDep {
 			Format: "python",
 		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	for pkg, info := range discoveredOpt {
+		out = append(out, ManifestDep{
+			Name:   pkg,
+			Scope:  "optional_extra",
+			Extra:  info.extra,
+			Via:    info.via,
+			Format: "python",
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Scope < out[j].Scope
+	})
 	return out
 }
 
-func parsePoetryLockBFS(rawBytes []byte, prodRoots []ManifestDep) []ManifestDep {
+func parsePoetryLockBFS(rawBytes []byte, manifestDeps []ManifestDep) []ManifestDep {
 	kvs := scanTOMLKeyValues(string(rawBytes))
 	type poetryPkg struct {
 		name     string
@@ -664,17 +899,24 @@ func parsePoetryLockBFS(rawBytes []byte, prodRoots []ManifestDep) []ManifestDep 
 		}
 	}
 
-	// Build BFS roots from manifest prod dependencies if available; otherwise non-dev, non-optional packages.
 	type qNode struct {
-		name string
-		via  string
+		name  string
+		via   string
+		extra string
 	}
-	var queue []qNode
+	var prodQueue []qNode
+	var optQueue []qNode
 	hasProdRoots := false
-	for _, pr := range prodRoots {
+	for _, pr := range manifestDeps {
 		if pr.Format == "python" && pr.Scope == "prod" {
 			hasProdRoots = true
-			queue = append(queue, qNode{name: pr.Name, via: pr.Name})
+			prodQueue = append(prodQueue, qNode{name: pr.Name, via: pr.Name})
+		} else if pr.Format == "python" && pr.Scope == "optional_extra" && !isDevOrNonRuntimeGroupName(pr.Extra) {
+			via := pr.Name
+			if pr.Extra != "" {
+				via = pr.Name + " [extra: " + pr.Extra + "]"
+			}
+			optQueue = append(optQueue, qNode{name: pr.Name, via: via, extra: pr.Extra})
 		}
 	}
 	if !hasProdRoots {
@@ -696,15 +938,15 @@ func parsePoetryLockBFS(rawBytes []byte, prodRoots []ManifestDep) []ManifestDep 
 					continue
 				}
 			}
-			queue = append(queue, qNode{name: p.name, via: p.name})
+			prodQueue = append(prodQueue, qNode{name: p.name, via: p.name})
 		}
 	}
 
 	visited := make(map[string]bool)
 	discovered := make(map[string]string)
-	for len(queue) > 0 {
-		curN := queue[0]
-		queue = queue[1:]
+	for len(prodQueue) > 0 {
+		curN := prodQueue[0]
+		prodQueue = prodQueue[1:]
 		if visited[curN.name] {
 			continue
 		}
@@ -713,14 +955,39 @@ func parsePoetryLockBFS(rawBytes []byte, prodRoots []ManifestDep) []ManifestDep 
 		if p == nil {
 			continue
 		}
-		if curN.via != curN.name {
-			discovered[curN.name] = curN.via
-		} else {
-			discovered[curN.name] = curN.name
-		}
+		discovered[curN.name] = curN.via
 		for _, dep := range p.deps {
 			if !visited[dep] {
-				queue = append(queue, qNode{name: dep, via: curN.via})
+				prodQueue = append(prodQueue, qNode{name: dep, via: curN.via})
+			}
+		}
+	}
+
+	type optDisc struct {
+		via   string
+		extra string
+	}
+	visitedOpt := make(map[string]bool)
+	discoveredOpt := make(map[string]optDisc)
+	for len(optQueue) > 0 {
+		curN := optQueue[0]
+		optQueue = optQueue[1:]
+		if visitedOpt[curN.name] {
+			continue
+		}
+		visitedOpt[curN.name] = true
+		p := byName[curN.name]
+		if p == nil {
+			continue
+		}
+		if _, inProd := discovered[curN.name]; !inProd {
+			if _, exists := discoveredOpt[curN.name]; !exists {
+				discoveredOpt[curN.name] = optDisc{via: curN.via, extra: curN.extra}
+			}
+		}
+		for _, dep := range p.deps {
+			if !visitedOpt[dep] {
+				optQueue = append(optQueue, qNode{name: dep, via: curN.via, extra: curN.extra})
 			}
 		}
 	}
@@ -734,7 +1001,21 @@ func parsePoetryLockBFS(rawBytes []byte, prodRoots []ManifestDep) []ManifestDep 
 			Format: "python",
 		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	for pkg, info := range discoveredOpt {
+		out = append(out, ManifestDep{
+			Name:   pkg,
+			Scope:  "optional_extra",
+			Extra:  info.extra,
+			Via:    info.via,
+			Format: "python",
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Scope < out[j].Scope
+	})
 	return out
 }
 
@@ -786,35 +1067,94 @@ func parsePackageLockJSON(rawBytes []byte) []ManifestDep {
 	return out
 }
 
-func parsePnpmLockYAML(rawBytes []byte) []ManifestDep {
-	// Parse pnpm-lock.yaml v5/v6/v9 packages/snapshots entries excluding `dev: true` blocks.
-	lines := strings.Split(string(rawBytes), "\n")
-	inPackages := false
-	curPkg := ""
-	curIsDev := false
-	seen := make(map[string]bool)
-	var entries []string
-
-	flush := func() {
-		if curPkg != "" && !curIsDev && !seen[curPkg] {
-			seen[curPkg] = true
-			entries = append(entries, curPkg)
+func splitYAMLMapLine(trimmed string) (key, val string, ok bool) {
+	if trimmed == "" || strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "#") {
+		return "", "", false
+	}
+	if trimmed[0] == '\'' || trimmed[0] == '"' {
+		q := trimmed[0]
+		end := strings.IndexByte(trimmed[1:], q)
+		if end >= 0 {
+			rest := strings.TrimSpace(trimmed[end+2:])
+			if strings.HasPrefix(rest, ":") {
+				k := trimmed[1 : end+1]
+				v := strings.TrimSpace(rest[1:])
+				return k, v, true
+			}
 		}
-		curPkg = ""
-		curIsDev = false
+	}
+	for i := 0; i < len(trimmed); i++ {
+		if trimmed[i] == ':' && (i+1 == len(trimmed) || trimmed[i+1] == ' ' || trimmed[i+1] == '\t') {
+			return strings.TrimSpace(trimmed[:i]), strings.TrimSpace(trimmed[i+1:]), true
+		}
+	}
+	return "", "", false
+}
+
+func cleanPnpmScalar(s string) string {
+	v := strings.TrimSpace(s)
+	v = strings.Trim(v, `"'`)
+	return strings.TrimSpace(v)
+}
+
+func isNonProdPnpmImporter(importer string) bool {
+	imp := strings.ToLower(cleanPnpmScalar(importer))
+	imp = strings.TrimSuffix(imp, ":")
+	imp = strings.Trim(imp, "/")
+	if imp == "" || imp == "." {
+		return false
+	}
+	for _, seg := range strings.Split(imp, "/") {
+		switch seg {
+		case "e2e", "test", "tests", "__tests__", "testing", "benchmark", "benchmarks",
+			"example", "examples", "docs", "doc", "dev-proxy", "tooling", ".storybook":
+			return true
+		}
+		if strings.HasPrefix(seg, "migrate-") || strings.HasSuffix(seg, "-dev") || strings.HasSuffix(seg, "-test") {
+			return true
+		}
+	}
+	return false
+}
+
+func isLockfileTestRunnerPkg(pkg string) bool {
+	switch strings.ToLower(strings.TrimSpace(pkg)) {
+	case "@playwright/test", "@vitest/browser-playwright", "@axe-core/playwright",
+		"@chromatic-com/playwright", "playwright-test", "pytest-playwright",
+		"vitest", "jest", "cypress", "@testing-library/dom",
+		"@storybook/nextjs-vite", "@storybook/addon-vitest", "storybook":
+		return true
+	default:
+		return false
+	}
+}
+
+func parsePnpmLockYAML(rawBytes []byte) []ManifestDep {
+	// Parse multi-document (`---`) pnpm-lock.yaml v5/v6/v9.
+	// In v9, devDependencies are excluded by running BFS from non-dev `importers:`
+	// (`dependencies` + `optionalDependencies`) across `snapshots:` (`dependencies` + `optionalDependencies`),
+	// skipping optional peer edges declared optional in `packages.*.peerDependenciesMeta` and test runners.
+	lines := strings.Split(string(rawBytes), "\n")
+
+	cleanKey := func(raw string) string {
+		k := cleanPnpmScalar(strings.TrimSuffix(strings.TrimSpace(raw), ":"))
+		k = strings.TrimPrefix(k, "/")
+		return k
+	}
+
+	stripPnpmPeers := func(key string) string {
+		if idx := strings.Index(key, "("); idx > 0 {
+			return key[:idx]
+		}
+		return key
 	}
 
 	extractPnpmKeyPkg := func(key string) string {
-		k := strings.TrimSpace(key)
-		k = strings.TrimSuffix(k, ":")
-		k = strings.Trim(k, `"'`)
-		k = strings.TrimPrefix(k, "/")
+		k := cleanKey(key)
 		if k == "" {
 			return ""
 		}
-		if idx := strings.Index(k, "("); idx > 0 {
-			k = k[:idx]
-		}
+		k = stripPnpmPeers(k)
 		if strings.HasPrefix(k, "@") {
 			slash := strings.Index(k, "/")
 			if slash < 0 {
@@ -832,34 +1172,320 @@ func parsePnpmLockYAML(rawBytes []byte) []ManifestDep {
 		return NormalizePackageName(k, "node")
 	}
 
-	for _, line := range lines {
-		if len(line) > 0 && line[0] != ' ' && line[0] != '\t' && line[0] != '#' {
-			flush()
-			trimmed := strings.TrimSpace(line)
-			inPackages = trimmed == "packages:" || trimmed == "snapshots:"
-			continue
+	type pnpmNodeRef struct {
+		pkg      string
+		exactKey string
+	}
+
+	type pnpmEdge struct {
+		ref           pnpmNodeRef
+		isOptional    bool
+		sourceBaseKey string
+	}
+
+	resolvePnpmTarget := func(depPkg, depVerRaw string) pnpmNodeRef {
+		ver := cleanPnpmScalar(depVerRaw)
+		if ver == "" || ver == "{}" || strings.HasPrefix(ver, "link:") || strings.HasPrefix(ver, "workspace:") {
+			return pnpmNodeRef{pkg: depPkg}
 		}
-		if !inPackages {
-			continue
+		verNoPeer := stripPnpmPeers(ver)
+		// Detect npm aliases such as `lexical-code-no-prism@0.41.0(...)`
+		hasAliasAt := strings.Contains(verNoPeer, "@") && (!strings.HasPrefix(verNoPeer, "@") || strings.Contains(verNoPeer[strings.Index(verNoPeer, "/")+1:], "@"))
+		if hasAliasAt {
+			aliasPkg := extractPnpmKeyPkg(ver)
+			if aliasPkg != "" {
+				return pnpmNodeRef{pkg: aliasPkg, exactKey: ver}
+			}
+			return pnpmNodeRef{pkg: depPkg, exactKey: ver}
 		}
+		return pnpmNodeRef{pkg: depPkg, exactKey: depPkg + "@" + ver}
+	}
+
+	hasImportersSection := false
+	hasSnapshotsSection := false
+
+	var importerRoots []pnpmNodeRef
+	seenRoots := make(map[string]bool)
+
+	snapEdgesByKey := make(map[string][]pnpmEdge)
+	snapEdgesByPkg := make(map[string][]pnpmEdge)
+	knownSnapKey := make(map[string]bool)
+
+	pkgEdgesByKey := make(map[string][]pnpmEdge)
+	pkgEdgesByPkg := make(map[string][]pnpmEdge)
+	knownPkgKey := make(map[string]bool)
+	optionalPeerByBasePkg := make(map[string]map[string]bool)
+
+	var legacyEntries []string
+	seenLegacy := make(map[string]bool)
+
+	section := "" // "importers", "packages", "snapshots"
+
+	// Importer parser state
+	curImpSkipped := false
+	curImpDepSection := "" // "dependencies" | "optionalDependencies"
+	pendingImpDepPkg := ""
+	pendingImpDepVer := ""
+
+	flushImporterDep := func() {
+		if pendingImpDepPkg != "" && !curImpSkipped {
+			ref := resolvePnpmTarget(pendingImpDepPkg, pendingImpDepVer)
+			if ref.pkg != "" {
+				rk := ref.pkg + "|" + ref.exactKey
+				if !seenRoots[rk] {
+					seenRoots[rk] = true
+					importerRoots = append(importerRoots, ref)
+				}
+			}
+		}
+		pendingImpDepPkg = ""
+		pendingImpDepVer = ""
+	}
+
+	// Packages / snapshots parser state
+	curEntryKey := ""
+	curEntryBaseKey := ""
+	curEntryPkg := ""
+	curEntrySubSection := "" // "dependencies" | "optionalDependencies" | "peerDependenciesMeta"
+	curPeerMetaPkg := ""
+	curIsDev := false
+
+	flushPkgOrSnap := func() {
+		if section == "packages" && curEntryPkg != "" && !curIsDev && !seenLegacy[curEntryPkg] {
+			seenLegacy[curEntryPkg] = true
+			legacyEntries = append(legacyEntries, curEntryPkg)
+		} else if section == "snapshots" && curEntryPkg != "" && !seenLegacy[curEntryPkg] {
+			seenLegacy[curEntryPkg] = true
+			legacyEntries = append(legacyEntries, curEntryPkg)
+		}
+		curEntryKey = ""
+		curEntryBaseKey = ""
+		curEntryPkg = ""
+		curEntrySubSection = ""
+		curPeerMetaPkg = ""
+		curIsDev = false
+	}
+
+	resetSection := func() {
+		flushImporterDep()
+		flushPkgOrSnap()
+		section = ""
+		curImpSkipped = false
+		curImpDepSection = ""
+	}
+
+	for _, rawLine := range lines {
+		line := strings.TrimRight(rawLine, "\r")
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		indent := len(line) - len(strings.TrimLeft(line, " "))
-		if indent == 2 && strings.HasSuffix(trimmed, ":") {
-			flush()
-			curPkg = extractPnpmKeyPkg(trimmed)
+		if trimmed == "---" || trimmed == "..." {
+			resetSection()
 			continue
 		}
-		if curPkg != "" && (trimmed == "dev: true" || trimmed == "dev:true") {
-			curIsDev = true
+
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		if indent == 0 && line[0] != '\t' {
+			resetSection()
+			switch trimmed {
+			case "importers:":
+				section = "importers"
+				hasImportersSection = true
+			case "snapshots:":
+				section = "snapshots"
+				hasSnapshotsSection = true
+			case "packages:":
+				section = "packages"
+			}
+			continue
+		}
+
+		switch section {
+		case "importers":
+			if indent == 2 {
+				flushImporterDep()
+				curImpDepSection = ""
+				curImpSkipped = isNonProdPnpmImporter(trimmed)
+				continue
+			}
+			if curImpSkipped {
+				continue
+			}
+			if indent == 4 {
+				flushImporterDep()
+				k, v, ok := splitYAMLMapLine(trimmed)
+				if ok && v != "{}" && (k == "dependencies" || k == "optionalDependencies") {
+					curImpDepSection = k
+				} else {
+					curImpDepSection = ""
+				}
+				continue
+			}
+			if curImpDepSection == "" {
+				continue
+			}
+			if indent == 6 {
+				flushImporterDep()
+				k, v, ok := splitYAMLMapLine(trimmed)
+				if ok {
+					pendingImpDepPkg = extractPnpmKeyPkg(k)
+					if v != "" && v != "{}" {
+						pendingImpDepVer = v
+					}
+				}
+				continue
+			}
+			if indent >= 8 && pendingImpDepPkg != "" {
+				k, v, ok := splitYAMLMapLine(trimmed)
+				if ok && k == "version" {
+					pendingImpDepVer = v
+				}
+			}
+
+		case "snapshots", "packages":
+			if indent == 2 {
+				flushPkgOrSnap()
+				k, _, ok := splitYAMLMapLine(trimmed)
+				if !ok {
+					continue
+				}
+				curEntryKey = cleanKey(k)
+				curEntryBaseKey = stripPnpmPeers(curEntryKey)
+				curEntryPkg = extractPnpmKeyPkg(curEntryKey)
+				if section == "snapshots" && curEntryKey != "" {
+					knownSnapKey[curEntryKey] = true
+				} else if section == "packages" && curEntryKey != "" {
+					knownPkgKey[curEntryKey] = true
+				}
+				continue
+			}
+			if curEntryPkg == "" {
+				continue
+			}
+			if indent == 4 {
+				curPeerMetaPkg = ""
+				if section == "packages" && (trimmed == "dev: true" || trimmed == "dev:true") {
+					curIsDev = true
+					curEntrySubSection = ""
+					continue
+				}
+				k, v, ok := splitYAMLMapLine(trimmed)
+				if ok && v != "{}" && (k == "dependencies" || k == "optionalDependencies" || (section == "packages" && k == "peerDependenciesMeta")) {
+					curEntrySubSection = k
+				} else {
+					curEntrySubSection = ""
+				}
+				continue
+			}
+			if curEntrySubSection == "peerDependenciesMeta" && section == "packages" {
+				if indent == 6 {
+					k, _, ok := splitYAMLMapLine(trimmed)
+					if ok {
+						curPeerMetaPkg = extractPnpmKeyPkg(k)
+					} else {
+						curPeerMetaPkg = ""
+					}
+					continue
+				}
+				if indent >= 8 && curPeerMetaPkg != "" && (trimmed == "optional: true" || trimmed == "optional:true") {
+					if optionalPeerByBasePkg[curEntryBaseKey] == nil {
+						optionalPeerByBasePkg[curEntryBaseKey] = make(map[string]bool)
+					}
+					optionalPeerByBasePkg[curEntryBaseKey][curPeerMetaPkg] = true
+				}
+				continue
+			}
+			if indent == 6 && (curEntrySubSection == "dependencies" || curEntrySubSection == "optionalDependencies") && !curIsDev {
+				k, v, ok := splitYAMLMapLine(trimmed)
+				if !ok {
+					continue
+				}
+				depPkg := extractPnpmKeyPkg(k)
+				if depPkg == "" {
+					continue
+				}
+				edge := pnpmEdge{
+					ref:           resolvePnpmTarget(depPkg, v),
+					isOptional:    curEntrySubSection == "optionalDependencies",
+					sourceBaseKey: curEntryBaseKey,
+				}
+				if section == "snapshots" {
+					snapEdgesByKey[curEntryKey] = append(snapEdgesByKey[curEntryKey], edge)
+					snapEdgesByPkg[curEntryPkg] = append(snapEdgesByPkg[curEntryPkg], edge)
+				} else {
+					pkgEdgesByKey[curEntryKey] = append(pkgEdgesByKey[curEntryKey], edge)
+					pkgEdgesByPkg[curEntryPkg] = append(pkgEdgesByPkg[curEntryPkg], edge)
+				}
+			}
 		}
 	}
-	flush()
+	resetSection()
+
+	if hasImportersSection {
+		if len(importerRoots) == 0 {
+			return nil
+		}
+		edgesByKey := pkgEdgesByKey
+		edgesByPkg := pkgEdgesByPkg
+		knownKey := knownPkgKey
+		if hasSnapshotsSection {
+			edgesByKey = snapEdgesByKey
+			edgesByPkg = snapEdgesByPkg
+			knownKey = knownSnapKey
+		}
+
+		queue := append([]pnpmNodeRef(nil), importerRoots...)
+		visitedNodes := make(map[string]bool)
+		discoveredPkgs := make(map[string]bool)
+
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			vk := cur.pkg + "|" + cur.exactKey
+			if visitedNodes[vk] {
+				continue
+			}
+			visitedNodes[vk] = true
+			if cur.pkg != "" {
+				discoveredPkgs[cur.pkg] = true
+			}
+			var nextEdges []pnpmEdge
+			if cur.exactKey != "" && knownKey[cur.exactKey] {
+				nextEdges = edgesByKey[cur.exactKey]
+			} else {
+				nextEdges = edgesByPkg[cur.pkg]
+			}
+			curBase := stripPnpmPeers(cur.exactKey)
+			for _, edge := range nextEdges {
+				if isLockfileTestRunnerPkg(edge.ref.pkg) {
+					continue
+				}
+				if edge.isOptional {
+					if peers := optionalPeerByBasePkg[edge.sourceBaseKey]; peers != nil && peers[edge.ref.pkg] {
+						continue
+					}
+					if peers := optionalPeerByBasePkg[curBase]; peers != nil && peers[edge.ref.pkg] {
+						continue
+					}
+				}
+				nvk := edge.ref.pkg + "|" + edge.ref.exactKey
+				if !visitedNodes[nvk] {
+					queue = append(queue, edge.ref)
+				}
+			}
+		}
+
+		var out []ManifestDep
+		for pkg := range discoveredPkgs {
+			out = append(out, ManifestDep{Name: pkg, Scope: "transitive_lockfile", Format: "node"})
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+		return out
+	}
 
 	var out []ManifestDep
-	for _, pkg := range entries {
+	for _, pkg := range legacyEntries {
 		out = append(out, ManifestDep{Name: pkg, Scope: "transitive_lockfile", Format: "node"})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -953,7 +1579,7 @@ func parseYarnLockBFS(rawBytes []byte, prodRoots []ManifestDep) []ManifestDep {
 			visited[cur] = true
 			out = append(out, ManifestDep{Name: cur, Scope: "transitive_lockfile", Format: "node"})
 			for _, nxt := range adj[cur] {
-				if !visited[nxt] {
+				if !visited[nxt] && !isLockfileTestRunnerPkg(nxt) {
 					q = append(q, nxt)
 				}
 			}
@@ -1027,7 +1653,7 @@ func parseCargoLockBFS(rawBytes []byte, prodRoots []ManifestDep) []ManifestDep {
 			visited[cur] = true
 			out = append(out, ManifestDep{Name: cur, Scope: "transitive_lockfile", Format: "rust"})
 			for _, nxt := range adj[cur] {
-				if !visited[nxt] {
+				if !visited[nxt] && !isLockfileTestRunnerPkg(nxt) {
 					q = append(q, nxt)
 				}
 			}
@@ -1402,8 +2028,4 @@ func splitTopLevelCommas(s string) []string {
 		parts = append(parts, strings.TrimSpace(s[start:]))
 	}
 	return parts
-}
-
-func lockfileDirMatches(lockRelSlash string, manifestDir string) bool {
-	return filepath.ToSlash(filepath.Dir(lockRelSlash)) == manifestDir
 }
