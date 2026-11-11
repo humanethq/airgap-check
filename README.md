@@ -1,4 +1,4 @@
-# ![airgap-check](docs/banner.png)
+# ![Humanet airgap-check](docs/banner.png)
 
 Find out what your AI app downloads, or tries to reach, when the network goes away.
 
@@ -8,7 +8,7 @@ Find out what your AI app downloads, or tries to reach, when the network goes aw
 
 A common assumption: point the LLM base URL at a local vLLM or Ollama instance and the app is ready for an offline network (an air-gapped VPC, a hospital or defense network, a container with no internet). In practice, many libraries fetch something on first use: tokenizer ranks, ONNX embedding weights, corpora, price maps, or telemetry. Offline, these calls either fail at first use or hang for tens of seconds on retry backoff.
 
-None of this is a bug in those libraries. They download once and cache. It only becomes visible when the network is gone. airgap-check tries to surface it before you deploy.
+None of this is a bug in those libraries. They download once and cache. It only becomes visible when the network is gone. Humanet airgap-check tries to surface it before you deploy.
 
 ## What it does
 
@@ -62,7 +62,7 @@ airgap-check /path/to/repo --json
 Read this before applying it: if your app loads Hugging Face models, pre-warm them at build time before setting `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`. Without a warm cache the app fails at startup instead of hanging.
 
 ```dockerfile
-# --- BEGIN AIR-GAP & TELEMETRY REMEDIATION ---
+# --- BEGIN HUMANET AIRGAP-CHECK REMEDIATION ---
 ENV DO_NOT_TRACK=1 \
     NEXT_TELEMETRY_DISABLED=1 \
     ANONYMIZED_TELEMETRY=False \
@@ -97,7 +97,7 @@ RUN TIKTOKEN_CACHE_DIR=/app/.cache/tiktoken python3 -c "import tiktoken; [tiktok
 
 # Pre-warm ChromaDB's default ONNX embedding model at build time
 RUN HOME=/app XDG_CACHE_HOME=/app/.cache python3 -c "from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2; ef = ONNXMiniLM_L6_V2(); ef(['airgap-warmup'])"
-# --- END AIR-GAP & TELEMETRY REMEDIATION ---
+# --- END HUMANET AIRGAP-CHECK REMEDIATION ---
 ```
 
 ## How `--run` works, and where it stops
@@ -280,7 +280,7 @@ Drop `.airgap-check.json` in your repository root (or pass `--rules path/to/rule
 - Secret values are never read, stored or logged. `.env` files are inspected for key names, non-empty presence, and `git ls-files` status.
 - `--run` mounts your repository read-only.
 
-airgap-check is not a security certification. It reports what it observed; a clean result does not prove that your application is safe to run in an isolated network.
+Humanet airgap-check is not a security certification. It reports what it observed; a clean result does not prove that your application is safe to run in an isolated network.
 
 ## Contributing
 

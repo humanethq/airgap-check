@@ -2,7 +2,7 @@
 set -eu
 
 REPO="humanethq/airgap-check"
-VERSION="${AIRGAP_CHECK_VERSION:-v0.2.2}"
+VERSION="${AIRGAP_CHECK_VERSION:-v0.2.3}"
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
@@ -30,7 +30,7 @@ URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-echo "Downloading airgap-check (${VERSION}) for ${OS}/${ARCH}..."
+echo "Downloading Humanet airgap-check (${VERSION}) for ${OS}/${ARCH}..."
 curl -fsSL "$URL" -o "${TMP_DIR}/${TARBALL}"
 tar -xzf "${TMP_DIR}/${TARBALL}" -C "$TMP_DIR"
 
@@ -41,5 +41,5 @@ if [ ! -w "$INSTALL_DIR" ]; then
 fi
 
 install -m 0755 "${TMP_DIR}/airgap-check" "${INSTALL_DIR}/airgap-check"
-echo "Installed airgap-check to ${INSTALL_DIR}/airgap-check"
+echo "Installed Humanet airgap-check to ${INSTALL_DIR}/airgap-check"
 "${INSTALL_DIR}/airgap-check" --version

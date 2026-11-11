@@ -30,7 +30,7 @@ func formatDependencyScopeBadge(scope string) string {
 
 func printCheckReportHuman(out io.Writer, r *CheckReport, showFix bool) {
 	_, _ = fmt.Fprintln(out, "┌─────────────────────────────────────────────────────────────────────────────┐")
-	_, _ = fmt.Fprintln(out, "│                   AIRGAP-CHECK: OFFLINE & TELEMETRY AUDIT                   │")
+	_, _ = fmt.Fprintln(out, "│               HUMANET AIRGAP-CHECK: OFFLINE & TELEMETRY AUDIT               │")
 	_, _ = fmt.Fprintln(out, "└─────────────────────────────────────────────────────────────────────────────┘")
 	_, _ = fmt.Fprintf(out, "  Target Repository : %s\n", r.TargetPath)
 	_, _ = fmt.Fprintf(out, "  Test Scope        : %s (%d manifests, %d lockfiles, %d source files, %d .env files)\n",
@@ -172,7 +172,7 @@ func printCheckReportHuman(out io.Writer, r *CheckReport, showFix bool) {
 
 func generateRemediationDockerfileSnippet(r *CheckReport) string {
 	var b strings.Builder
-	b.WriteString("# --- BEGIN AIR-GAP & TELEMETRY REMEDIATION (paste into your Dockerfile) ---\n")
+	b.WriteString("# --- BEGIN HUMANET AIRGAP-CHECK REMEDIATION (paste into your Dockerfile) ---\n")
 	b.WriteString("# 1. Silence background SDK telemetry, online cost-map lookups & enforce writable cache paths\n")
 	b.WriteString("ENV DO_NOT_TRACK=1 \\\n")
 	b.WriteString("    NEXT_TELEMETRY_DISABLED=1 \\\n")
@@ -293,6 +293,6 @@ func generateRemediationDockerfileSnippet(r *CheckReport) string {
 		b.WriteString("# ACTION: Add explicit timeout=(2, 10) to requests/urllib HTTP calls flagged in Section 6 (Robustness Hints) to avoid infinite hangs.\n")
 	}
 
-	b.WriteString("# --- END AIR-GAP & TELEMETRY REMEDIATION ---")
+	b.WriteString("# --- END HUMANET AIRGAP-CHECK REMEDIATION ---")
 	return b.String()
 }

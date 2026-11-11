@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func createTestFixture(t *testing.T) string {
@@ -1325,6 +1327,53 @@ SERVICE_API_TOKEN=tok_live_999999
 	for _, realSecret := range []string{"GITHUB_TOKEN", "SERVICE_API_TOKEN"} {
 		if !secretKeys[realSecret] {
 			t.Fatalf("real secret %q must still be flagged, got %+v", realSecret, report.EgressAndSecretRisks)
+		}
+	}
+}
+
+func TestHumanetCLIBranding(t *testing.T) {
+	dir := createTestFixture(t)
+	report, err := AnalyzeProjectAirgapAndEgress(dir)
+	if err != nil {
+		t.Fatalf("AnalyzeProjectAirgapAndEgress: %v", err)
+	}
+
+	var buf bytes.Buffer
+	printCheckReportHuman(&buf, report, true)
+	out := buf.String()
+
+	lines := strings.Split(out, "\n")
+	if len(lines) < 3 {
+		t.Fatalf("expected at least 3 banner lines, got %d", len(lines))
+	}
+	if w0, w1, w2 := utf8.RuneCountInString(lines[0]), utf8.RuneCountInString(lines[1]), utf8.RuneCountInString(lines[2]); w0 != 79 || w1 != 79 || w2 != 79 {
+		t.Fatalf("expected symmetrical 79-rune banner box widths, got top=%d mid=%d bot=%d", w0, w1, w2)
+	}
+	for _, want := range []string{
+		"HUMANET AIRGAP-CHECK: OFFLINE & TELEMETRY AUDIT",
+		"# --- BEGIN HUMANET AIRGAP-CHECK REMEDIATION (paste into your Dockerfile) ---",
+		"# --- END HUMANET AIRGAP-CHECK REMEDIATION ---",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected human CLI report to contain %q, got:\n%s", want, out)
+		}
+	}
+
+	if got := formatVersionString(); !strings.HasPrefix(got, "Humanet airgap-check ") {
+		t.Fatalf("expected version string to start with 'Humanet airgap-check ', got %q", got)
+	}
+
+	var helpBuf bytes.Buffer
+	fs, _ := newAirgapFlagSet(flag.ContinueOnError, &helpBuf)
+	fs.Usage()
+	helpOut := helpBuf.String()
+	for _, want := range []string{
+		"Humanet airgap-check " + version,
+		"Usage of Humanet airgap-check: airgap-check [flags] [path]",
+		"Print Humanet airgap-check version and exit",
+	} {
+		if !strings.Contains(helpOut, want) {
+			t.Fatalf("expected help output to contain %q, got:\n%s", want, helpOut)
 		}
 	}
 }

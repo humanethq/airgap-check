@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -15,7 +16,7 @@ import (
 	"time"
 )
 
-var version = "v0.2.2"
+var version = "v0.2.3"
 
 var (
 	httpsURLRegex        = regexp.MustCompile(`https?://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(?::[0-9]+)?(/[^\s"'` + "`" + `)]*)?`)
@@ -53,35 +54,54 @@ func normalizeCLIArgs(raw []string) []string {
 	return append(flagsPart, posPart...)
 }
 
-func main() {
-	var (
-		jsonOutput  bool
-		dynamicRun  bool
-		showFix     bool
-		buildImage  bool
-		showVersion bool
-		dockerImage string
-		runCmd      string
-		timeoutSec  int
-		dnsAction   string
-		rulesPath   string
-	)
+type cliOptions struct {
+	jsonOutput  bool
+	dynamicRun  bool
+	showFix     bool
+	buildImage  bool
+	showVersion bool
+	dockerImage string
+	runCmd      string
+	timeoutSec  int
+	dnsAction   string
+	rulesPath   string
+}
 
-	fs := flag.NewFlagSet("airgap-check", flag.ExitOnError)
-	fs.BoolVar(&jsonOutput, "json", false, "Output audit report in JSON format")
-	fs.BoolVar(&dynamicRun, "run", false, "Run dynamic air-gap verification inside `docker run --rm --network none` and capture DNS/TLS SNI/HTTP attempts")
-	fs.BoolVar(&showFix, "fix", false, "Print a ready-to-paste Dockerfile snippet (ENV + build-time pre-warming RUN lines)")
-	fs.BoolVar(&buildImage, "build", false, "Auto-build a temporary image from the repo's Dockerfile when --run is used without --image")
-	fs.StringVar(&dockerImage, "image", "", "Docker image to use with --run (defaults to detected ecosystem base image)")
-	fs.StringVar(&runCmd, "run-cmd", "", "Custom command to execute inside the --network none container with --run")
-	fs.IntVar(&timeoutSec, "timeout", 45, "Timeout in seconds for --run dynamic execution")
-	fs.StringVar(&dnsAction, "dns-action", "sinkhole", "UDP:53 sinkhole behavior under --run: 'sinkhole' (return 127.0.0.1 for TLS SNI/HTTP capture) or 'nxdomain'")
-	fs.StringVar(&rulesPath, "rules", "", "Optional path to custom JSON rules file (default: auto-loads .airgap-check.json in repo root)")
-	fs.BoolVar(&showVersion, "version", false, "Print airgap-check version and exit")
+func newAirgapFlagSet(errorHandling flag.ErrorHandling, out io.Writer) (*flag.FlagSet, *cliOptions) {
+	opts := &cliOptions{}
+	fs := flag.NewFlagSet("Humanet airgap-check", errorHandling)
+	if out != nil {
+		fs.SetOutput(out)
+	}
+	fs.BoolVar(&opts.jsonOutput, "json", false, "Output audit report in JSON format")
+	fs.BoolVar(&opts.dynamicRun, "run", false, "Run dynamic air-gap verification inside `docker run --rm --network none` and capture DNS/TLS SNI/HTTP attempts")
+	fs.BoolVar(&opts.showFix, "fix", false, "Print a ready-to-paste Dockerfile snippet (ENV + build-time pre-warming RUN lines)")
+	fs.BoolVar(&opts.buildImage, "build", false, "Auto-build a temporary image from the repo's Dockerfile when --run is used without --image")
+	fs.StringVar(&opts.dockerImage, "image", "", "Docker image to use with --run (defaults to detected ecosystem base image)")
+	fs.StringVar(&opts.runCmd, "run-cmd", "", "Custom command to execute inside the --network none container with --run")
+	fs.IntVar(&opts.timeoutSec, "timeout", 45, "Timeout in seconds for --run dynamic execution")
+	fs.StringVar(&opts.dnsAction, "dns-action", "sinkhole", "UDP:53 sinkhole behavior under --run: 'sinkhole' (return 127.0.0.1 for TLS SNI/HTTP capture) or 'nxdomain'")
+	fs.StringVar(&opts.rulesPath, "rules", "", "Optional path to custom JSON rules file (default: auto-loads .airgap-check.json in repo root)")
+	fs.BoolVar(&opts.showVersion, "version", false, "Print Humanet airgap-check version and exit")
+	fs.Usage = func() {
+		uOut := fs.Output()
+		_, _ = fmt.Fprintf(uOut, "Humanet airgap-check %s\n", version)
+		_, _ = fmt.Fprintln(uOut, "Usage of Humanet airgap-check: airgap-check [flags] [path]")
+		fs.PrintDefaults()
+	}
+	return fs, opts
+}
+
+func formatVersionString() string {
+	return fmt.Sprintf("Humanet airgap-check %s", version)
+}
+
+func main() {
+	fs, opts := newAirgapFlagSet(flag.ExitOnError, nil)
 	_ = fs.Parse(normalizeCLIArgs(os.Args[1:]))
 
-	if showVersion {
-		fmt.Printf("airgap-check %s\n", version)
+	if opts.showVersion {
+		fmt.Println(formatVersionString())
 		return
 	}
 
@@ -90,37 +110,37 @@ func main() {
 		target = fs.Arg(0)
 	}
 
-	report, err := AnalyzeProjectAirgapAndEgressWithRules(target, rulesPath)
+	report, err := AnalyzeProjectAirgapAndEgressWithRules(target, opts.rulesPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "airgap-check error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Humanet airgap-check error: %v\n", err)
 		os.Exit(1)
 	}
-	if dynamicRun {
+	if opts.dynamicRun {
 		dynRes, dynErr := RunDynamicAirgapCheck(
 			context.Background(),
 			report.TargetPath,
 			report,
 			DynamicRunOptions{
-				DockerImage:     dockerImage,
-				RunCmd:          runCmd,
-				Timeout:         time.Duration(timeoutSec) * time.Second,
-				DnsAction:       dnsAction,
-				BuildDockerfile: buildImage,
+				DockerImage:     opts.dockerImage,
+				RunCmd:          opts.runCmd,
+				Timeout:         time.Duration(opts.timeoutSec) * time.Second,
+				DnsAction:       opts.dnsAction,
+				BuildDockerfile: opts.buildImage,
 			},
 		)
 		if dynErr != nil {
-			fmt.Fprintf(os.Stderr, "airgap-check --run error: %v\n", dynErr)
+			fmt.Fprintf(os.Stderr, "Humanet airgap-check --run error: %v\n", dynErr)
 			os.Exit(1)
 		}
 		mergeDynamicResultIntoReport(report, dynRes)
 	}
-	if jsonOutput {
+	if opts.jsonOutput {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(report)
 		return
 	}
-	printCheckReportHuman(os.Stdout, report, showFix)
+	printCheckReportHuman(os.Stdout, report, opts.showFix)
 }
 
 func AnalyzeProjectAirgapAndEgress(targetDir string) (*CheckReport, error) {
